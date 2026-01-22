@@ -12,10 +12,13 @@ Verde can be used either with a dedicated sync tool (Like Rojo/Argon/Azul) or wi
 
 ## Features
 
-- **Live Instance Tree**: View your Roblox game's instance hierarchy in VS Code
-- **Script Opening**: Double-click scripts from the explorer to open them right in VS Code (works with Rojo/Argon/Azul/Luau-LSP sourcemaps)
-- **Instance Operations**: Rename, duplicate, delete, copy, and paste instances
-- **Properties Panel**: View and edit instance properties right from VS Code
+- **Live Instance Tree**: View your Roblox game's instance hierarchy in VS Code.
+- **Script Opening**: Double-click scripts from the explorer to open them right in VS Code (works with Rojo/Argon/Azul/Luau-LSP sourcemaps).
+- **Instance Operations**: Rename, duplicate, delete, copy, and paste instances.
+- **Ctrl+P Quick-Pick Menu**: Quickly see most recently interacted instances, or search for a specific instance to quickly navigate to it.
+- **Properties Panel**: View and edit instance properties right from VS Code.
+- **Play Sounds right from VS Code**: Opening the Properties panel of a Sound instance, there will be a green Play button, just like in studio.
+  - If not playing, make sure the `Only Play Audio When Window In Focus` Studio setting is disabled.
 
 ![Sample Image](assets/sample.png)
 
