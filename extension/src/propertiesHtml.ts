@@ -12,7 +12,7 @@ export function getPropertiesHtml(extensionUri: vscode.Uri, options: PropertiesH
 
     const htmlPath = path.join(extensionUri.fsPath, "resources", "properties.html");
     const cssPath = path.join(extensionUri.fsPath, "resources", "properties.css");
-    const sortersPath = path.join(extensionUri.fsPath, "src", "robloxPropertySorters.js");
+    const sortersPath = path.join(extensionUri.fsPath, "resources", "robloxPropertySorters.js");
 
     let cssContent = '';
     try {
