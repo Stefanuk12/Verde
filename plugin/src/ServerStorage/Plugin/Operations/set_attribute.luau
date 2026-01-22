@@ -1,5 +1,6 @@
-local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
+local ChangeHistoryHelper = require(script.Parent.Parent.Shared.ChangeHistoryService)
 local PropertyTracker = require(script.Parent.Parent.Shared.PropertyTracker)
+local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
 
 return function(operation)
 	local nodeId = operation.nodeId
@@ -16,7 +17,7 @@ return function(operation)
 		return false, "Attribute name is required"
 	end
 
-	local success, err = pcall(function()
+	local function setAttributeValue()
 		if
 			typeof(attributeValue) == "table"
 			and attributeValue.X ~= nil
@@ -52,10 +53,16 @@ return function(operation)
 		else
 			instance:SetAttribute(attributeName, attributeValue)
 		end
-	end)
+	end
+
+	local success, errorMessage = ChangeHistoryHelper.RecordOperation(
+		"SetAttribute",
+		"Set Attribute",
+		setAttributeValue
+	)
 
 	if not success then
-		return false, tostring(err)
+		return false, errorMessage
 	end
 
 	PropertyTracker.triggerUpdate(nodeId)

@@ -1,3 +1,4 @@
+local ChangeHistoryHelper = require(script.Parent.Parent.Shared.ChangeHistoryService)
 local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
 local PropertyTracker = require(script.Parent.Parent.Shared.PropertyTracker)
 local print = require(script.Parent.Parent.Utils.print)
@@ -13,8 +14,7 @@ return function(operation)
 		return false
 	end
 
-	local errorMessage = nil
-	local success, result = pcall(function()
+	local function setPropertyValue()
 		if typeof(propertyValue) == "table" and propertyValue.EnumName and propertyValue.EnumType then
 			local enumType = Enum[propertyValue.EnumType]
 			if enumType then
@@ -103,10 +103,11 @@ return function(operation)
 		else
 			instance[propertyName] = propertyValue
 		end
-	end)
+	end
+
+	local success, errorMessage = ChangeHistoryHelper.RecordOperation("SetProperty", "Set Property", setPropertyValue)
 
 	if not success then
-		errorMessage = tostring(result)
 		print("set_property failed for", propertyName, ":", errorMessage)
 		return false, errorMessage
 	end

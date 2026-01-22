@@ -302,6 +302,10 @@ connected.onExit = function()
 		connected.client = nil
 	end
 
+	-- Commit any pending operations before disconnecting
+	local ChangeHistoryHelper = require(script.Parent.Parent.Shared.ChangeHistoryService)
+	ChangeHistoryHelper.CommitPendingOperations()
+
 	PropertyTracker.cleanupTracking()
 
 	for _, connection in connections do

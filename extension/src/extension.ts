@@ -728,6 +728,46 @@ export async function activate(context: vscode.ExtensionContext) {
 		})
 	);
 
+	context.subscriptions.push(
+		vscode.commands.registerCommand("verde.undo", async () => {
+			if (!backend) {
+				return;
+			}
+
+			try {
+				const result = await backend.sendOperation({
+					type: "undo"
+				});
+
+				if (!result.success) {
+					vscode.window.showErrorMessage(`Failed to undo: ${result.error}`);
+				}
+			} catch (error) {
+				vscode.window.showErrorMessage(`Failed to undo: ${String(error)}`);
+			}
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("verde.redo", async () => {
+			if (!backend) {
+				return;
+			}
+
+			try {
+				const result = await backend.sendOperation({
+					type: "redo"
+				});
+
+				if (!result.success) {
+					vscode.window.showErrorMessage(`Failed to redo: ${result.error}`);
+				}
+			} catch (error) {
+				vscode.window.showErrorMessage(`Failed to redo: ${String(error)}`);
+			}
+		})
+	);
+
 	function getInstancePath(node: Node): string[] {
 		const path: string[] = [node.name];
 		let current = node;

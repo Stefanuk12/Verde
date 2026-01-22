@@ -1,5 +1,6 @@
-local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
+local ChangeHistoryHelper = require(script.Parent.Parent.Shared.ChangeHistoryService)
 local PropertyTracker = require(script.Parent.Parent.Shared.PropertyTracker)
+local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
 
 return function(operation)
 	local nodeId = operation.nodeId
@@ -49,12 +50,12 @@ return function(operation)
 		return false, "Unknown attribute type: " .. attributeType
 	end
 
-	local success, err = pcall(function()
+	local success, errorMessage = ChangeHistoryHelper.RecordOperation("AddAttribute", "Add Attribute", function()
 		instance:SetAttribute(attributeName, defaultValue)
 	end)
 
 	if not success then
-		return false, tostring(err)
+		return false, errorMessage
 	end
 
 	PropertyTracker.triggerUpdate(nodeId)

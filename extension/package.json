@@ -143,6 +143,16 @@
         "command": "verde.goToInstance",
         "title": "Go to Instance",
         "category": "Verde"
+      },
+      {
+        "command": "verde.undo",
+        "title": "Undo",
+        "category": "Verde"
+      },
+      {
+        "command": "verde.redo",
+        "title": "Redo",
+        "category": "Verde"
       }
     ],
     "keybindings": [
@@ -198,6 +208,18 @@
         "command": "verde.goToInstance",
         "key": "ctrl+shift+g",
         "mac": "cmd+shift+g"
+      },
+      {
+        "command": "verde.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "focusedView == verde.view || focusedView == verde.properties"
+      },
+      {
+        "command": "verde.redo",
+        "key": "ctrl+y",
+        "mac": "cmd+shift+z",
+        "when": "focusedView == verde.view || focusedView == verde.properties"
       }
     ],
     "menus": {

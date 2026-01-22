@@ -1,5 +1,6 @@
-local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
+local ChangeHistoryHelper = require(script.Parent.Parent.Shared.ChangeHistoryService)
 local PropertyTracker = require(script.Parent.Parent.Shared.PropertyTracker)
+local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
 
 return function(operation)
 	local nodeId = operation.nodeId
@@ -27,8 +28,14 @@ return function(operation)
 		return false, "Attribute does not exist"
 	end
 
-	instance:SetAttribute(newName, currentValue)
-	instance:SetAttribute(oldName, nil)
+	local success, errorMessage = ChangeHistoryHelper.RecordOperation("RenameAttribute", "Rename Attribute", function()
+		instance:SetAttribute(newName, currentValue)
+		instance:SetAttribute(oldName, nil)
+	end)
+
+	if not success then
+		return false, errorMessage
+	end
 
 	PropertyTracker.triggerUpdate(nodeId)
 	return true

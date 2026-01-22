@@ -1,3 +1,4 @@
+local ChangeHistoryHelper = require(script.Parent.Parent.Shared.ChangeHistoryService)
 local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
 local Clipboard = require(script.Parent.Parent.Shared.Clipboard)
 local NameUtils = require(script.Parent.Parent.Utils.name)
@@ -18,6 +19,8 @@ return function(payload: { targetNodeId: string? }): boolean
 		return true
 	end
 
+	local pastedInstances = {}
+
 	for _, clipboardContent in Clipboard do
 		local pastedInstance = clipboardContent:Clone()
 
@@ -25,7 +28,25 @@ return function(payload: { targetNodeId: string? }): boolean
 		local newName = NameUtils.GetValidName(targetParent, baseName)
 
 		pastedInstance.Name = newName
-		pastedInstance.Parent = targetParent
+		table.insert(pastedInstances, pastedInstance)
+	end
+
+	local success, errorMessage = ChangeHistoryHelper.RecordOperation("PasteInstance", "Paste Instance", function()
+		for _, pastedInstance in pastedInstances do
+			pastedInstance.Parent = targetParent
+		end
+	end)
+
+	if not success then
+		for _, pastedInstance in pastedInstances do
+			pastedInstance:Destroy()
+		end
+		error(errorMessage or "Failed to record paste operation")
+	end
+
+	for _, pastedInstance in pastedInstances do
+		local newId = pastedInstance:GetDebugId(0)
+		InstanceMap[newId] = pastedInstance
 	end
 
 	return true
