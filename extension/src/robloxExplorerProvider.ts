@@ -1,5 +1,5 @@
 import { ExplorerDeltaOp } from "./backend";
-import { InstanceSorter, SortableNode } from "./instanceSorter";
+import { InstanceSorter } from "./instanceSorter";
 
 const DELTA_OP_ORDER: Record<string, number> = {
 	remove_node: 0,

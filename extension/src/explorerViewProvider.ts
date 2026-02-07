@@ -1,0 +1,585 @@
+import * as vscode from "vscode";
+import { RobloxExplorerProvider, Node } from "./robloxExplorerProvider";
+import { VerdeBackend } from "./backend";
+import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
+import { isScriptClass } from "./utils";
+
+type WebviewNode = {
+	id: string;
+	name: string;
+	className: string;
+	children: string[];
+	isScript: boolean;
+};
+
+export class ExplorerViewProvider implements vscode.WebviewViewProvider {
+	public static readonly viewType = "verde.view";
+
+	private webviewView: vscode.WebviewView | undefined;
+	private selectedIds: string[] = [];
+	private selectionListeners: ((nodes: Node[]) => void)[] = [];
+
+	constructor(
+		private readonly extensionUri: vscode.Uri,
+		private readonly explorerProvider: RobloxExplorerProvider,
+		private readonly backend: VerdeBackend,
+	) {
+		this.explorerProvider.onChange(() => this.pushTree());
+	}
+
+	public onSelectionChanged(listener: (nodes: Node[]) => void): void {
+		this.selectionListeners.push(listener);
+	}
+
+	public getSelection(): Node[] {
+		return this.selectedIds
+			.map(id => this.explorerProvider.getNodeById(id))
+			.filter((n): n is Node => n !== undefined);
+	}
+
+	public isVisible(): boolean {
+		return this.webviewView?.visible ?? false;
+	}
+
+	public startRename(nodeId: string): void {
+		this.post({ type: "startRename", nodeId });
+	}
+
+	public reveal(node: Node): void {
+		const ancestors: string[] = [];
+		let cur: Node | undefined = node;
+		while (cur?.parentId) {
+			ancestors.push(cur.parentId);
+			cur = this.explorerProvider.getNodeById(cur.parentId);
+		}
+		this.selectedIds = [node.id];
+		this.post({
+			type: "revealNode",
+			nodeId: node.id,
+			ancestors,
+			selectedIds: [node.id],
+		});
+		this.fireSelectionChanged();
+	}
+
+	public resolveWebviewView(
+		webviewView: vscode.WebviewView,
+		_context: vscode.WebviewViewResolveContext,
+		_token: vscode.CancellationToken,
+	): void {
+		this.webviewView = webviewView;
+		webviewView.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [
+				vscode.Uri.joinPath(this.extensionUri, "assets"),
+				vscode.Uri.joinPath(this.extensionUri, "resources"),
+			],
+		};
+		const assetBase = webviewView.webview.asWebviewUri(
+			vscode.Uri.joinPath(this.extensionUri, "assets")
+		).toString();
+		webviewView.webview.html = this.buildHtml(webviewView.webview, assetBase);
+		webviewView.webview.onDidReceiveMessage(m => this.onMessage(m));
+		webviewView.onDidDispose(() => { this.webviewView = undefined; });
+		this.pushTree();
+	}
+
+	private post(msg: unknown): void {
+		this.webviewView?.webview.postMessage(msg);
+	}
+
+	private pushTree(): void {
+		if (!this.webviewView) return;
+		const all = this.explorerProvider.getAllNodes();
+		const nodes: Record<string, WebviewNode> = {};
+		for (const n of all) {
+			const sorted = this.explorerProvider.getSortedChildren(n.id);
+			nodes[n.id] = {
+				id: n.id,
+				name: n.name,
+				className: n.className,
+				children: sorted.map(c => c.id),
+				isScript: isScriptClass(n.className),
+			};
+		}
+		const roots = this.explorerProvider.getSortedChildren(null);
+		this.post({
+			type: "updateTree",
+			nodes,
+			rootIds: roots.map(c => c.id),
+			selectedIds: this.selectedIds,
+		});
+	}
+
+	private fireSelectionChanged(): void {
+		const nodes = this.getSelection();
+		for (const cb of this.selectionListeners) cb(nodes);
+	}
+
+	private onMessage(msg: any): void {
+		switch (msg.type) {
+			case "selectionChanged":
+				this.selectedIds = msg.nodeIds ?? [];
+				this.fireSelectionChanged();
+				break;
+			case "createInstance":
+				this.doCreateInstance(msg.parentId, msg.className);
+				break;
+			case "renameInstance": {
+				const node = msg.nodeId ? this.explorerProvider.getNodeById(msg.nodeId) : undefined;
+				if (node && typeof msg.newName === "string") {
+					vscode.commands.executeCommand("verde.renameInstance", node, msg.newName);
+				}
+				break;
+			}
+			case "runCommand": {
+				const node = msg.nodeId ? this.explorerProvider.getNodeById(msg.nodeId) : undefined;
+				if (node) {
+					vscode.commands.executeCommand(msg.command, node);
+				} else {
+					vscode.commands.executeCommand(msg.command);
+				}
+				break;
+			}
+			case "scriptActivated": {
+				const node = this.explorerProvider.getNodeById(msg.nodeId);
+				if (node) vscode.commands.executeCommand("verde.openScript", node);
+				break;
+			}
+		}
+	}
+
+	private async waitForNode(nodeId: string, timeoutMs: number = 3000): Promise<Node | null> {
+		const start = Date.now();
+		while (Date.now() - start < timeoutMs) {
+			const node = this.explorerProvider.getNodeById(nodeId);
+			if (node) return node;
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		return null;
+	}
+
+	private async doCreateInstance(parentId: string, className: string): Promise<void> {
+		try {
+			const result = await this.backend.sendOperation({
+				type: "create_instance",
+				parentId,
+				className,
+			});
+			if (!result.success) {
+				vscode.window.showErrorMessage(`Failed to create instance: ${result.error}`);
+				return;
+			}
+			if (result.data && typeof result.data === "string") {
+				const newNode = await this.waitForNode(result.data);
+				if (newNode) {
+					this.reveal(newNode);
+					this.post({ type: "focusTree" });
+					if (isScriptClass(newNode.className)) {
+						vscode.commands.executeCommand("verde.openScript", newNode);
+					}
+				}
+			}
+		} catch (e) {
+			vscode.window.showErrorMessage(`Failed to create instance: ${String(e)}`);
+		}
+	}
+
+	private buildHtml(webview: vscode.Webview, assetBase: string): string {
+		const csp = webview.cspSource;
+		return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none'; img-src ${csp}; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;font-family:var(--vscode-font-family,sans-serif);font-size:var(--vscode-font-size,13px);color:var(--vscode-foreground);background:var(--vscode-sideBar-background)}
+body{display:flex;flex-direction:column}
+
+#search-bar{padding:4px 4px;flex-shrink:0;background:var(--vscode-sideBar-background)}
+#search{width:100%;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,transparent);border-radius:2px;padding:3px 4px;outline:none;font:inherit}
+#search:focus{border-color:var(--vscode-focusBorder)}
+
+#tree{flex:1;overflow-y:auto;overflow-x:hidden;outline:none;padding:0;background:var(--vscode-sideBar-background)}
+.tree-row{display:flex;align-items:center;height:22px;cursor:pointer;padding-right:0;white-space:nowrap;user-select:none}
+.tree-row:hover{background:var(--vscode-list-hoverBackground)}
+.tree-row.selected{background:rgba(14,99,156,.35);color:var(--vscode-list-activeSelectionForeground,#fff)}
+#tree:focus-within .tree-row.selected{background:rgba(14,99,156,.4);color:var(--vscode-list-activeSelectionForeground,#fff)}
+
+.tree-arrow{width:16px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;font-size:9px;opacity:.7}
+.tree-arrow:hover{opacity:1}
+.tree-arrow::before{content:'\\25B6';display:inline-block;transition:transform .1s}
+.tree-arrow.expanded::before{transform:rotate(90deg)}
+.tree-arrow.leaf{visibility:hidden;pointer-events:none}
+
+.tree-icon{width:16px;height:16px;flex-shrink:0;margin-right:4px;image-rendering:pixelated}
+.tree-row.tree-indent-guides{background-repeat:no-repeat}
+.tree-name-group{flex:1;min-width:0;display:flex;align-items:center;gap:6px}
+.tree-name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tree-rename-input{flex:1;min-width:60px;height:18px;margin:0;padding:0 4px;border:1px solid var(--vscode-focusBorder);border-radius:2px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);font:inherit;outline:none}
+.tree-rename-input:focus{border-color:var(--vscode-focusBorder);box-shadow:0 0 0 1px var(--vscode-focusBorder)}
+
+.tree-add-btn{display:none;width:16px;height:16px;border-radius:50%;border:none;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font-size:14px;line-height:16px;text-align:center;cursor:pointer;flex-shrink:0;padding:0;align-items:center;justify-content:center}
+.tree-row:hover .tree-add-btn{display:inline-flex}
+.tree-add-btn:hover{background:var(--vscode-button-secondaryHoverBackground)}
+
+#ctx-menu{position:fixed;z-index:1000;background:var(--vscode-menu-background,var(--vscode-editor-background));border:1px solid var(--vscode-menu-border,var(--vscode-widget-border,#454545));box-shadow:0 2px 8px rgba(0,0,0,.3);min-width:160px;padding:4px 0;border-radius:4px}
+#ctx-menu.hidden{display:none}
+.ctx-item{padding:4px 20px 4px 10px;cursor:pointer;white-space:nowrap;color:var(--vscode-menu-foreground,var(--vscode-foreground))}
+.ctx-item:hover{background:var(--vscode-menu-selectionBackground,var(--vscode-list-activeSelectionBackground));color:var(--vscode-menu-selectionForeground,var(--vscode-list-activeSelectionForeground))}
+.ctx-sep{height:1px;margin:4px 0;background:var(--vscode-menu-separatorBackground,var(--vscode-widget-border,#454545))}
+
+#quick-add{position:fixed;top:0;left:0;z-index:2000;pointer-events:none}
+#quick-add.hidden{display:none}
+#qa-panel{pointer-events:auto;position:fixed;width:280px;max-height:320px;background:var(--vscode-sideBar-background);border:1px solid var(--vscode-widget-border);box-shadow:0 2px 8px rgba(0,0,0,.15);display:flex;flex-direction:column;border-radius:4px;overflow:hidden}
+#qa-search{width:100%;border:none;border-bottom:1px solid var(--vscode-widget-border);background:var(--vscode-sideBar-background);color:var(--vscode-foreground);padding:8px 10px;outline:none;font:inherit}
+#qa-search::placeholder{color:var(--vscode-input-placeholderForeground)}
+#qa-search:focus{border-bottom-color:var(--vscode-focusBorder)}
+#qa-list-wrap{overflow-y:auto;flex:1;min-height:0}
+.qa-section{font-size:11px;font-weight:600;color:var(--vscode-foreground);padding:6px 10px 4px;text-transform:uppercase;letter-spacing:0.5px}
+.qa-item{display:flex;align-items:center;padding:5px 10px;cursor:pointer;height:28px;color:var(--vscode-foreground)}
+.qa-item.selected{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
+.qa-item:not(.selected):hover{background:var(--vscode-list-hoverBackground)}
+.qa-icon{width:16px;height:16px;margin-right:8px;image-rendering:pixelated;flex-shrink:0}
+</style>
+</head>
+<body>
+<div id="search-bar"><input id="search" type="text" placeholder="Search explorer..." spellcheck="false" /></div>
+<div id="tree" tabindex="0"></div>
+<div id="quick-add" class="hidden">
+  <div id="qa-panel">
+    <input id="qa-search" type="text" placeholder="Search object" spellcheck="false" autocomplete="off" />
+    <div id="qa-list-wrap">
+      <div id="qa-list"></div>
+    </div>
+  </div>
+</div>
+<div id="ctx-menu" class="hidden"></div>
+<script>
+(function(){
+var ASSET=${JSON.stringify(assetBase)};
+var CLASSES=${JSON.stringify(ROBLOX_CLASS_NAMES)};
+var vscode=acquireVsCodeApi();
+
+var nodes={},rootIds=[],selectedIds=[];
+var searchFilter='';
+var qaParentId=null,qaFiltered=CLASSES,qaIdx=0,qaOutsideClick=null;
+var ctxNodeId=null;
+var renameNodeId=null;
+
+var expandedIds=new Set();
+var saved=vscode.getState();
+if(saved&&Array.isArray(saved.exp))expandedIds=new Set(saved.exp);
+function saveExp(){vscode.setState({exp:[...expandedIds]})}
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+var treeEl=document.getElementById('tree');
+var searchEl=document.getElementById('search');
+var ctxEl=document.getElementById('ctx-menu');
+var qaEl=document.getElementById('quick-add');
+var qaPanel=document.getElementById('qa-panel');
+var qaSearchEl=document.getElementById('qa-search');
+var qaListEl=document.getElementById('qa-list');
+
+document.addEventListener('error',function(e){if(e.target&&e.target.tagName==='IMG')e.target.style.visibility='hidden'},true);
+
+/* ---- messages from extension ---- */
+window.addEventListener('message',function(e){
+  var m=e.data;
+  switch(m.type){
+    case 'updateTree':
+      nodes=m.nodes||{};rootIds=m.rootIds||[];
+      selectedIds=m.selectedIds||selectedIds;
+      renderTree();break;
+    case 'updateSelection':
+      selectedIds=m.selectedIds||[];updateSelVis();break;
+    case 'revealNode':
+      if(Array.isArray(m.ancestors))m.ancestors.forEach(function(id){expandedIds.add(id)});
+      selectedIds=m.selectedIds||[];
+      saveExp();renderTree();
+      requestAnimationFrame(function(){scrollTo(m.nodeId);treeEl.focus()});break;
+    case 'focusTree':
+      treeEl.focus();break;
+    case 'scrollToNode':
+      requestAnimationFrame(function(){scrollTo(m.nodeId)});break;
+    case 'expandNodes':
+      if(Array.isArray(m.nodeIds))m.nodeIds.forEach(function(id){expandedIds.add(id)});
+      saveExp();renderTree();break;
+    case 'startRename':
+      renameNodeId=m.nodeId||null;
+      renderTree();
+      afterRenameInputMount();break;
+  }
+});
+
+/* ---- search ---- */
+searchEl.addEventListener('input',function(){searchFilter=searchEl.value.trim().toLowerCase();renderTree()});
+
+var visCache={};
+function isVis(id){
+  if(id in visCache)return visCache[id];
+  var n=nodes[id];
+  if(!n)return(visCache[id]=false);
+  if(n.name.toLowerCase().indexOf(searchFilter)>=0||n.className.toLowerCase().indexOf(searchFilter)>=0)return(visCache[id]=true);
+  for(var i=0;i<n.children.length;i++){if(isVis(n.children[i]))return(visCache[id]=true)}
+  return(visCache[id]=false);
+}
+
+function cancelRename(){
+  renameNodeId=null;
+  renderTree();
+}
+function submitRename(inp){
+  var row=inp.closest('.tree-row');
+  if(!row)return;
+  var id=row.dataset.id;
+  var val=inp.value.trim();
+  if(!val)cancelRename();
+  else{
+    vscode.postMessage({type:'renameInstance',nodeId:id,newName:val});
+    cancelRename();
+  }
+}
+function afterRenameInputMount(){
+  if(!renameNodeId)return;
+  var inp=treeEl.querySelector('.tree-rename-input');
+  if(!inp)return;
+  inp.focus();
+  inp.select();
+  inp.addEventListener('keydown',function(ev){
+    if(ev.key==='Enter'){submitRename(inp);ev.preventDefault();ev.stopPropagation()}
+    else if(ev.key==='Escape'){cancelRename();ev.preventDefault();ev.stopPropagation()}
+  });
+  inp.addEventListener('blur',function(){setTimeout(function(){if(renameNodeId)cancelRename()},0)});
+  inp.addEventListener('click',function(ev){ev.stopPropagation()});
+}
+
+/* ---- tree rendering ---- */
+function renderTree(){
+  visCache={};
+  var h=[];
+  for(var i=0;i<rootIds.length;i++)buildRow(rootIds[i],0,h);
+  treeEl.innerHTML=h.join('');
+  if(renameNodeId)afterRenameInputMount();
+}
+var INDENT=12;
+var LINE_COLOR='var(--vscode-tree-indentGuidesStroke, rgba(128,128,128,0.35))';
+function buildRow(id,depth,h){
+  if(searchFilter&&!isVis(id))return;
+  var n=nodes[id];if(!n)return;
+  var has=n.children.length>0;
+  var exp=searchFilter?has:expandedIds.has(id);
+  var sel=selectedIds.indexOf(id)>=0;
+  var pad=depth*INDENT;
+  var ac=has?(exp?' expanded':''):' leaf';
+  var rowClass='tree-row'+(sel?' selected':'')+(depth>0?' tree-indent-guides':'');
+  var style='padding-left:'+pad+'px';
+  if(depth>0){
+    var bgs=[],pos=[],sz=[];
+    for(var i=0;i<depth;i++){
+      bgs.push('linear-gradient(to right, '+LINE_COLOR+' 0, '+LINE_COLOR+' 1px, transparent 1px)');
+      pos.push(((i+0.5)*INDENT)+'px 0');
+      sz.push(INDENT+'px 100%');
+    }
+    style+=';background-image:'+bgs.join(',')+';background-position:'+pos.join(',')+';background-size:'+sz.join(',')+';background-repeat:no-repeat';
+  }
+  h.push('<div class="'+rowClass+'" data-id="'+id+'" data-s="'+(n.isScript?1:0)+'" style="'+style+'">');
+  h.push('<span class="tree-arrow'+ac+'"></span>');
+  h.push('<img class="tree-icon" src="'+ASSET+'/'+esc(n.className)+'.png">');
+  h.push('<span class="tree-name-group">');
+  if(id===renameNodeId){
+    h.push('<input class="tree-rename-input" type="text" value="'+esc(n.name)+'" data-id="'+id+'">');
+  }else{
+    h.push('<span class="tree-name">'+esc(n.name)+'</span>');
+  }
+  h.push('<button class="tree-add-btn">+</button>');
+  h.push('</span></div>');
+  if(exp)for(var i=0;i<n.children.length;i++)buildRow(n.children[i],depth+1,h);
+}
+
+/* ---- selection ---- */
+function updateSelVis(){
+  treeEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.toggle('selected',selectedIds.indexOf(r.dataset.id)>=0)});
+}
+function scrollTo(id){
+  var el=treeEl.querySelector('[data-id="'+id+'"]');
+  if(el)el.scrollIntoView({block:'nearest'});
+}
+
+/* ---- tree events ---- */
+treeEl.addEventListener('click',function(e){
+  treeEl.focus();
+  var row=e.target.closest('.tree-row');
+  if(!row){selectedIds=[];updateSelVis();vscode.postMessage({type:'selectionChanged',nodeIds:[]});return}
+  var id=row.dataset.id;
+  var arrow=e.target.closest('.tree-arrow');
+  if(arrow&&!arrow.classList.contains('leaf')){
+    if(expandedIds.has(id))expandedIds.delete(id);else expandedIds.add(id);
+    saveExp();renderTree();return;
+  }
+  if(e.target.closest('.tree-add-btn')){openQA(id,row);return}
+  if(e.ctrlKey||e.metaKey){var i=selectedIds.indexOf(id);if(i>=0)selectedIds.splice(i,1);else selectedIds.push(id)}
+  else selectedIds=[id];
+  updateSelVis();
+  vscode.postMessage({type:'selectionChanged',nodeIds:selectedIds.slice()});
+});
+
+treeEl.addEventListener('dblclick',function(e){
+  var row=e.target.closest('.tree-row');
+  if(!row||e.target.closest('.tree-arrow')||e.target.closest('.tree-add-btn'))return;
+  if(row.dataset.s==='1')vscode.postMessage({type:'scriptActivated',nodeId:row.dataset.id});
+});
+
+treeEl.addEventListener('contextmenu',function(e){
+  e.preventDefault();
+  var row=e.target.closest('.tree-row');if(!row)return;
+  var id=row.dataset.id;
+  if(selectedIds.indexOf(id)<0){selectedIds=[id];updateSelVis();vscode.postMessage({type:'selectionChanged',nodeIds:[id]})}
+  showCtx(e.clientX,e.clientY,id,row.dataset.s==='1');
+});
+
+/* ---- context menu ---- */
+function showCtx(x,y,id,isScript){
+  ctxNodeId=id;
+  var items=[
+    {l:'Rename',c:'verde.renameInstance'},
+    {l:'Duplicate',c:'verde.duplicateInstance'},
+    {l:'Delete',c:'verde.deleteInstance'},
+    {l:'Add Child...',c:'verde.addInstance'},
+    null,
+    {l:'Copy',c:'verde.copyInstance'},
+    {l:'Paste',c:'verde.pasteInstance'},
+    null,
+    {l:'Copy Roblox Path',c:'verde.copyRobloxPath'}
+  ];
+  if(isScript){items.push({l:'Copy File Path',c:'verde.copyFilePath'});items.push(null);items.push({l:'Open Script',c:'verde.openScript'})}
+  var html='';
+  for(var i=0;i<items.length;i++){
+    var it=items[i];
+    if(!it){html+='<div class="ctx-sep"></div>';continue}
+    html+='<div class="ctx-item" data-cmd="'+it.c+'">'+esc(it.l)+'</div>';
+  }
+  ctxEl.innerHTML=html;
+  ctxEl.style.left=x+'px';ctxEl.style.top=y+'px';
+  ctxEl.classList.remove('hidden');
+  requestAnimationFrame(function(){
+    var r=ctxEl.getBoundingClientRect();
+    if(r.right>window.innerWidth)ctxEl.style.left=Math.max(0,window.innerWidth-r.width-2)+'px';
+    if(r.bottom>window.innerHeight)ctxEl.style.top=Math.max(0,window.innerHeight-r.height-2)+'px';
+  });
+}
+function hideCtx(){ctxEl.classList.add('hidden');ctxNodeId=null}
+
+ctxEl.addEventListener('click',function(e){
+  var item=e.target.closest('.ctx-item');if(!item||!ctxNodeId)return;
+  var nid=ctxNodeId;var cmd=item.dataset.cmd;hideCtx();
+  if(cmd==='verde.renameInstance'){renameNodeId=nid;renderTree();afterRenameInputMount()}
+  else vscode.postMessage({type:'runCommand',command:cmd,nodeId:nid});
+});
+document.addEventListener('click',function(e){if(!e.target.closest('#ctx-menu'))hideCtx()});
+
+/* ---- quick-add ---- */
+function openQA(parentId,rowEl){
+  qaParentId=parentId;qaFiltered=CLASSES;qaIdx=0;qaSearchEl.value='';
+  renderQA();qaEl.classList.remove('hidden');
+  var rect=rowEl.getBoundingClientRect();
+  var panelW=280;var panelMaxH=320;
+  var top=rect.bottom+2;var left=rect.left;
+  if(top+panelMaxH>window.innerHeight)top=Math.max(2,rect.top-panelMaxH-2);
+  if(left+panelW>window.innerWidth)left=window.innerWidth-panelW-2;
+  if(left<2)left=2;
+  qaPanel.style.top=top+'px';qaPanel.style.left=left+'px';
+  qaSearchEl.focus();
+  setTimeout(function(){
+    qaOutsideClick=function(e){if(!qaPanel.contains(e.target))closeQA()};
+    document.addEventListener('click',qaOutsideClick);
+  },0);
+}
+function closeQA(){
+  if(qaOutsideClick){document.removeEventListener('click',qaOutsideClick);qaOutsideClick=null}
+  qaEl.classList.add('hidden');qaParentId=null;
+}
+
+qaSearchEl.addEventListener('input',function(){
+  var q=qaSearchEl.value.trim().toLowerCase();
+  if(!q){qaFiltered=CLASSES}
+  else{
+    qaFiltered=CLASSES.filter(function(c){return c.toLowerCase().indexOf(q)>=0});
+    qaFiltered.sort(function(a,b){return(a.toLowerCase().indexOf(q)===0?0:1)-(b.toLowerCase().indexOf(q)===0?0:1)});
+  }
+  qaIdx=0;renderQA();
+});
+
+qaSearchEl.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){closeQA();e.stopPropagation()}
+  else if(e.key==='Enter'){
+    if(qaFiltered.length>0&&qaParentId){vscode.postMessage({type:'createInstance',parentId:qaParentId,className:qaFiltered[qaIdx]});closeQA()}
+  }else if(e.key==='ArrowDown'){e.preventDefault();if(qaIdx<qaFiltered.length-1){qaIdx++;updateQASel()}}
+  else if(e.key==='ArrowUp'){e.preventDefault();if(qaIdx>0){qaIdx--;updateQASel()}}
+});
+
+function renderQA(){
+  var html='';
+  for(var i=0;i<qaFiltered.length;i++){
+    var c=qaFiltered[i];
+    html+='<div class="qa-item'+(i===qaIdx?' selected':'')+'" data-cls="'+esc(c)+'">';
+    html+='<img class="qa-icon" src="'+ASSET+'/'+esc(c)+'.png">';
+    html+='<span>'+esc(c)+'</span></div>';
+  }
+  qaListEl.innerHTML=html;
+}
+function updateQASel(){
+  qaListEl.querySelectorAll('.qa-item').forEach(function(el,i){el.classList.toggle('selected',i===qaIdx)});
+  var sel=qaListEl.querySelector('.qa-item.selected');
+  if(sel)sel.scrollIntoView({block:'nearest'});
+}
+
+qaListEl.addEventListener('click',function(e){
+  var item=e.target.closest('.qa-item');
+  if(!item||!qaParentId)return;
+  vscode.postMessage({type:'createInstance',parentId:qaParentId,className:item.dataset.cls});
+  closeQA();
+});
+qaListEl.addEventListener('mousemove',function(e){
+  var item=e.target.closest('.qa-item');if(!item)return;
+  var items=qaListEl.querySelectorAll('.qa-item');
+  for(var i=0;i<items.length;i++){if(items[i]===item&&i!==qaIdx){qaIdx=i;updateQASel();break}}
+});
+
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){hideCtx();closeQA()}});
+
+/* ---- keyboard shortcuts (only when tree area has focus, not search or quick-add) ---- */
+function isTreeFocused(){
+  var ae=document.activeElement;
+  if(!ae)return false;
+  if(ae===searchEl||searchEl.contains(ae))return false;
+  if(!qaEl.classList.contains('hidden')&&qaEl.contains(ae))return false;
+  if(ae.closest&&ae.closest('.tree-rename-input'))return false;
+  return treeEl.contains(ae)||ae===treeEl||ae===document.body;
+}
+document.addEventListener('keydown',function(e){
+  if(!isTreeFocused())return;
+  var nodeId=selectedIds.length>0?selectedIds[0]:null;
+  var cmd=null;
+  if(e.key==='Delete'){cmd='verde.deleteInstance';e.preventDefault()}
+  else if((e.key==='F2'||e.key==='Enter')&&!renameNodeId&&nodeId){renameNodeId=nodeId;renderTree();afterRenameInputMount();e.preventDefault();return}
+  else if((e.ctrlKey||e.metaKey)&&e.key==='c'){cmd='verde.copyInstance';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&e.key==='v'){cmd='verde.pasteInstance';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&e.key==='d'){cmd='verde.duplicateInstance';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key==='a'){cmd='verde.addInstance';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&e.key==='z'&&!e.shiftKey){cmd='verde.undo';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&(e.key==='y'||(e.key==='z'&&e.shiftKey))){cmd='verde.redo';e.preventDefault()}
+  if(cmd){
+    if(nodeId)vscode.postMessage({type:'runCommand',command:cmd,nodeId:nodeId});
+    else vscode.postMessage({type:'runCommand',command:cmd,nodeId:''});
+  }
+});
+})();
+</script>
+</body>
+</html>`;
+	}
+}

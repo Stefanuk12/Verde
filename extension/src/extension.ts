@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { RobloxExplorerProvider, Node } from "./robloxExplorerProvider";
+import { ExplorerViewProvider } from "./explorerViewProvider";
 import { VerdeBackend } from "./backend";
 import { PropertiesViewProvider } from "./propertiesViewProvider";
 import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
@@ -12,11 +13,10 @@ import * as fzy from "fzy.js";
 let backend: VerdeBackend | null = null;
 let sourcemapParser: SourcemapParser;
 let propertiesViewProvider: PropertiesViewProvider;
+let explorerViewProvider: ExplorerViewProvider;
 let instanceHistory: InstanceHistory;
 let cachedQuickPickItems: (vscode.QuickPickItem & { node: Node })[] = [];
 let cachedSearchStrings: string[] = [];
-
-let scriptActivationTracker: { [nodeId: string]: { count: number, timeout: NodeJS.Timeout | null } } = {};
 
 export async function activate(context: vscode.ExtensionContext) {
 	const outputChannel = vscode.window.createOutputChannel("Verde Backend");
@@ -25,19 +25,10 @@ export async function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(outputChannel);
 	context.subscriptions.push(statusBarItem);
 
-	const explorerProvider = new RobloxExplorerProvider(context.extensionUri);
+	const explorerProvider = new RobloxExplorerProvider();
 	const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri || context.extensionUri;
 	sourcemapParser = new SourcemapParser(workspaceRoot);
 	instanceHistory = new InstanceHistory(10);
-
-	const explorerView = vscode.window.createTreeView("verde.view", {
-		treeDataProvider: explorerProvider,
-		dragAndDropController: explorerProvider.getDragAndDropController(),
-		showCollapseAll: true,
-		canSelectMany: true
-	});
-
-	context.subscriptions.push(explorerView);
 
 	const rebuildQuickPickCache = () => {
 		const allNodes = explorerProvider.getAllNodes();
@@ -92,11 +83,13 @@ export async function activate(context: vscode.ExtensionContext) {
 		vscode.window.registerWebviewViewProvider(PropertiesViewProvider.viewType, propertiesViewProvider)
 	);
 
-	explorerProvider.setBackend(backend);
+	explorerViewProvider = new ExplorerViewProvider(context.extensionUri, explorerProvider, backend);
 
-	explorerView.onDidChangeSelection((event) => {
-		const selection = event.selection;
+	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(ExplorerViewProvider.viewType, explorerViewProvider)
+	);
 
+	explorerViewProvider.onSelectionChanged((selection) => {
 		if (selection.length === 1) {
 			const node = selection[0];
 			propertiesViewProvider.show(node);
@@ -116,7 +109,7 @@ export async function activate(context: vscode.ExtensionContext) {
 				return;
 			}
 
-			if (!explorerView.visible) {
+			if (!explorerViewProvider.isVisible()) {
 				return;
 			}
 
@@ -127,7 +120,7 @@ export async function activate(context: vscode.ExtensionContext) {
 				if (instancePath) {
 					const node = explorerProvider.getNodeByInstancePath(instancePath);
 					if (node) {
-						await explorerView.reveal(node, { select: true, focus: false });
+						explorerViewProvider.reveal(node);
 
 						// force-refocus the text editor
 						await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
@@ -141,13 +134,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('verde.navigateToInstance', async (instanceId: string) => {
-			if (!explorerView.visible) {
+			if (!explorerViewProvider.isVisible()) {
 				return;
 			}
 
 			const node = explorerProvider.getNodeById(instanceId);
 			if (node) {
-				await explorerView.reveal(node, { select: true, focus: false });
+				explorerViewProvider.reveal(node);
 			} else {
 				vscode.window.showWarningMessage(`Instance ${instanceId} not found in explorer`);
 			}
@@ -208,7 +201,7 @@ export async function activate(context: vscode.ExtensionContext) {
 				instanceHistory.add(node, instancePath);
 
 				try {
-					await explorerView.reveal(node, { select: true, focus: false });
+					explorerViewProvider.reveal(node);
 				} catch (error) {
 					console.debug('Failed to reveal node in explorer:', error);
 				}
@@ -269,13 +262,16 @@ export async function activate(context: vscode.ExtensionContext) {
 			}
 
 			let node: any = null;
+			let newNameArg: string | undefined;
 			if (args.length > 0 && args[0]) {
 				node = args[0];
-			} else {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					node = treeSelections[0];
-				}
+			}
+			if (args.length > 1 && typeof args[1] === "string") {
+				newNameArg = args[1];
+			}
+			if (!node) {
+				const sel = explorerViewProvider.getSelection();
+				if (sel.length > 0) node = sel[0];
 			}
 
 			if (!node) {
@@ -283,71 +279,50 @@ export async function activate(context: vscode.ExtensionContext) {
 				return;
 			}
 
-			const newName = await vscode.window.showInputBox({
-				prompt: `Rename "${node.name}"`,
-				value: node.name,
-				valueSelection: [0, node.name.length],
-				placeHolder: "Enter new name",
-				validateInput: (value) => {
-					if (!value || value.trim() === "") {
-						return "Name cannot be empty";
-					}
-					return null;
+			// inline rename from webview passes newName; otherwise start inline rename in webview
+			if (newNameArg !== undefined) {
+				const newName = newNameArg.trim();
+				if (!newName) return;
+				const isScript = isScriptClass(node.className);
+				let oldFileUri: vscode.Uri | null = null;
+				if (isScript) {
+					await sourcemapParser.loadSourcemaps();
+					const oldInstancePath = getInstancePath(node);
+					oldFileUri = sourcemapParser.findFilePath(oldInstancePath);
 				}
-			});
-
-			if (!newName || newName.trim() === "") {
+				try {
+					const result = await backend.sendOperation({
+						type: "rename_instance",
+						nodeId: node.id,
+						newName
+					});
+					if (!result.success) {
+						vscode.window.showErrorMessage(`Failed to rename instance: ${result.error}`);
+					} else if (isScript) {
+						await backend.waitForNextSnapshot();
+						await sourcemapParser.loadSourcemaps();
+						const updatedNode = explorerProvider.getNodeById(node.id);
+						if (updatedNode) {
+							if (oldFileUri) {
+								const tabs = vscode.window.tabGroups.all.flatMap(tg => tg.tabs);
+								const tabToClose = tabs.find(tab => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === oldFileUri!.toString());
+								if (tabToClose) await vscode.window.tabGroups.close(tabToClose);
+							}
+							const newInstancePath = getInstancePath(updatedNode);
+							const newFileUri = sourcemapParser.findFilePath(newInstancePath);
+							if (newFileUri) {
+								const document = await vscode.workspace.openTextDocument(newFileUri);
+								await vscode.window.showTextDocument(document, { viewColumn: vscode.ViewColumn.One, preview: false });
+							}
+						}
+					}
+				} catch (error) {
+					vscode.window.showErrorMessage(`Failed to rename instance: ${String(error)}`);
+				}
 				return;
 			}
 
-			const oldName = node.name;
-			const isScript = isScriptClass(node.className);
-
-			let oldFileUri: vscode.Uri | null = null;
-			if (isScript) {
-				await sourcemapParser.loadSourcemaps();
-				const oldInstancePath = getInstancePath(node);
-				oldFileUri = sourcemapParser.findFilePath(oldInstancePath);
-			}
-
-			try {
-				const result = await backend.sendOperation({
-					type: "rename_instance",
-					nodeId: node.id,
-					newName: newName.trim()
-				});
-
-				if (!result.success) {
-					vscode.window.showErrorMessage(`Failed to rename instance: ${result.error}`);
-				} else if (isScript) {
-					await backend.waitForNextSnapshot();
-					await sourcemapParser.loadSourcemaps();
-					const updatedNode = explorerProvider.getNodeById(node.id);
-
-					if (updatedNode) {
-						if (oldFileUri) {
-							const tabs = vscode.window.tabGroups.all.flatMap(tg => tg.tabs);
-							const tabToClose = tabs.find(tab => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === oldFileUri.toString());
-							if (tabToClose) {
-								await vscode.window.tabGroups.close(tabToClose);
-							}
-						}
-
-						const newInstancePath = getInstancePath(updatedNode);
-						const newFileUri = sourcemapParser.findFilePath(newInstancePath);
-
-						if (newFileUri) {
-							const document = await vscode.workspace.openTextDocument(newFileUri);
-							await vscode.window.showTextDocument(document, {
-								viewColumn: vscode.ViewColumn.One,
-								preview: false
-							});
-						}
-					}
-				}
-			} catch (error) {
-				vscode.window.showErrorMessage(`Failed to rename instance: ${String(error)}`);
-			}
+			explorerViewProvider.startRename(node.id);
 		})
 	);
 
@@ -361,10 +336,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (args.length > 0 && args[0]) {
 				nodes = [args[0]];
 			} else {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					nodes = [...treeSelections];
-				}
+				nodes = [...explorerViewProvider.getSelection()];
 			}
 
 			if (nodes.length === 0) {
@@ -410,10 +382,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (args.length > 0 && args[0]) {
 				nodes = [args[0]];
 			} else {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					nodes = [...treeSelections];
-				}
+				nodes = [...explorerViewProvider.getSelection()];
 			}
 
 			if (nodes.length === 0) {
@@ -478,10 +447,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (args.length > 0 && args[0]) {
 				nodes = [args[0]];
 			} else {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					nodes = [...treeSelections];
-				}
+				nodes = [...explorerViewProvider.getSelection()];
 			}
 
 			if (nodes.length === 0) {
@@ -514,9 +480,9 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (args.length > 0 && args[0]) {
 				targetNodeId = args[0].id;
 			} else {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					targetNodeId = treeSelections[0].id;
+				const sel = explorerViewProvider.getSelection();
+				if (sel.length > 0) {
+					targetNodeId = sel[0].id;
 				}
 			}
 
@@ -541,7 +507,7 @@ export async function activate(context: vscode.ExtensionContext) {
 				return;
 			}
 
-			if (!explorerView.visible) {
+			if (!explorerViewProvider.isVisible()) {
 				return;
 			}
 
@@ -549,9 +515,9 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (args.length > 0 && args[0]) {
 				parentNode = args[0];
 			} else {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					parentNode = treeSelections[0];
+				const sel = explorerViewProvider.getSelection();
+				if (sel.length > 0) {
+					parentNode = sel[0];
 				}
 			}
 
@@ -595,7 +561,7 @@ export async function activate(context: vscode.ExtensionContext) {
 						const newNodeId = result.data;
 						const newNode = explorerProvider.getNodeById(newNodeId);
 						if (newNode) {
-							await explorerView.reveal(newNode, { select: true, focus: true });
+							explorerViewProvider.reveal(newNode);
 
 							if (isScriptClass(newNode.className)) {
 								waitForScriptInSourcemap(newNode, 2000).catch(error => {
@@ -611,36 +577,6 @@ export async function activate(context: vscode.ExtensionContext) {
 		})
 	);
 
-
-	context.subscriptions.push(
-		vscode.commands.registerCommand("verde.handleScriptActivation", async (node: Node) => {
-			if (node.children.length > 0) {
-				await vscode.commands.executeCommand('list.toggleExpand', node);
-			}
-
-			const nodeId = node.id;
-
-			if (scriptActivationTracker[nodeId]?.timeout) {
-				clearTimeout(scriptActivationTracker[nodeId].timeout);
-			}
-
-			if (!scriptActivationTracker[nodeId]) {
-				scriptActivationTracker[nodeId] = { count: 0, timeout: null };
-			}
-
-			scriptActivationTracker[nodeId].count++;
-
-			scriptActivationTracker[nodeId].timeout = setTimeout(() => {
-				scriptActivationTracker[nodeId].count = 0;
-			}, 300);
-
-			if (scriptActivationTracker[nodeId].count === 2) {
-				await vscode.commands.executeCommand('verde.openScript', node);
-				scriptActivationTracker[nodeId].count = 0;
-			}
-		})
-	);
-
 	context.subscriptions.push(
 		vscode.commands.registerCommand("verde.togglePropertiesPanelMode", () => {
 			vscode.commands.executeCommand("workbench.view.extension.verdeContainer");
@@ -650,9 +586,9 @@ export async function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand("verde.openScript", async (node: Node) => {
 			if (!node) {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					node = treeSelections[0];
+				const sel = explorerViewProvider.getSelection();
+				if (sel.length > 0) {
+					node = sel[0];
 				}
 			}
 
@@ -684,9 +620,9 @@ export async function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand("verde.copyRobloxPath", async (node: Node) => {
 			if (!node) {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					node = treeSelections[0];
+				const sel = explorerViewProvider.getSelection();
+				if (sel.length > 0) {
+					node = sel[0];
 				}
 			}
 
@@ -707,9 +643,9 @@ export async function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand("verde.copyFilePath", async (node: Node) => {
 			if (!node) {
-				const treeSelections = explorerView.selection;
-				if (treeSelections && treeSelections.length > 0) {
-					node = treeSelections[0];
+				const sel = explorerViewProvider.getSelection();
+				if (sel.length > 0) {
+					node = sel[0];
 				}
 			}
 
