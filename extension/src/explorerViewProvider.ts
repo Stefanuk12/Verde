@@ -666,8 +666,8 @@ document.addEventListener('keydown',function(e){
   else if((e.ctrlKey||e.metaKey)&&e.key==='v'){cmd='verde.pasteInstance';e.preventDefault()}
   else if((e.ctrlKey||e.metaKey)&&e.key==='d'){cmd='verde.duplicateInstance';e.preventDefault()}
   else if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key==='a'){cmd='verde.addInstance';e.preventDefault()}
-  else if((e.ctrlKey||e.metaKey)&&e.key==='z'&&!e.shiftKey){cmd='verde.undo';e.preventDefault()}
-  else if((e.ctrlKey||e.metaKey)&&(e.key==='y'||(e.key==='z'&&e.shiftKey))){cmd='verde.redo';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'&&!e.shiftKey){cmd='verde.undo';e.preventDefault()}
+  else if((e.ctrlKey||e.metaKey)&&(e.key.toLowerCase()==='y'||(e.key.toLowerCase()==='z'&&e.shiftKey))){cmd='verde.redo';e.preventDefault()}
   if(cmd){
     if(nodeId)vscode.postMessage({type:'runCommand',command:cmd,nodeId:nodeId});
     else vscode.postMessage({type:'runCommand',command:cmd,nodeId:''});

@@ -2836,13 +2836,14 @@
         });
 
         window.addEventListener("keydown", (event) => {
-            if ((event.ctrlKey || event.metaKey) && event.key === "z" && !event.shiftKey) {
+            const key = event.key.toLowerCase();
+            if ((event.ctrlKey || event.metaKey) && key === "z" && !event.shiftKey) {
                 event.preventDefault();
                 vscode.postMessage({ type: "undo" });
-            } else if ((event.ctrlKey || event.metaKey) && event.key === "z" && event.shiftKey) {
+            } else if ((event.ctrlKey || event.metaKey) && key === "z" && event.shiftKey) {
                 event.preventDefault();
                 vscode.postMessage({ type: "redo" });
-            } else if ((event.ctrlKey || event.metaKey) && event.key === "y") {
+            } else if ((event.ctrlKey || event.metaKey) && key === "y") {
                 event.preventDefault();
                 vscode.postMessage({ type: "redo" });
             }
