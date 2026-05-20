@@ -72,7 +72,7 @@ export type TextRange = {
 export type ExplorerDeltaOp =
     | { type: "add_subtree"; timestamp: number; parentId: string | null; rootId: string; nodes: Snapshot["nodes"] }
     | { type: "remove_node"; timestamp: number; id: string }
-    | { type: "update_node"; timestamp: number; id: string; name?: string; disabled?: boolean }
+    | { type: "update_node"; timestamp: number; id: string; name?: string; disabled?: boolean; runContext?: string }
     | { type: "move_node"; timestamp: number; id: string; newParentId: string | null };
 
 type RobloxInboundMessage =

@@ -15,6 +15,7 @@ export type Node = {
 	parentId: string | null;
 	children: string[];
 	disabled?: boolean;
+	runContext?: string;
 };
 
 export type Snapshot = {
@@ -168,6 +169,7 @@ export class RobloxExplorerProvider {
 					if (!node) break;
 					if (op.name !== undefined) node.name = op.name;
 					if (op.disabled !== undefined) node.disabled = op.disabled;
+					if (op.runContext !== undefined) node.runContext = op.runContext;
 					break;
 				}
 				case "move_node": {

@@ -14,6 +14,7 @@ type Node = {
 	parentId: string?,
 	children: { string },
 	disabled: boolean?,
+	runContext: string?,
 }
 
 type Snapshot = {
@@ -53,6 +54,7 @@ function SerializeDatamodel.serializeFull(): (Snapshot, { [string]: Instance })
 
 		if instance:IsA("BaseScript") then
 			node.disabled = not instance.Enabled
+			node.runContext = (instance :: BaseScript).RunContext.Name
 		end
 
 		instanceMap[id] = instance
@@ -108,6 +110,7 @@ function SerializeDatamodel.serializeSubtree(instance: Instance): (string, { Nod
 
 		if inner:IsA("BaseScript") then
 			node.disabled = not inner.Enabled
+			node.runContext = (inner :: BaseScript).RunContext.Name
 		end
 
 		table.insert(nodes, node)

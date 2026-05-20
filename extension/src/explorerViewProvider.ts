@@ -2,13 +2,14 @@ import * as vscode from "vscode";
 import { RobloxExplorerProvider, Node } from "./robloxExplorerProvider";
 import { VerdeBackend } from "./backend";
 import { getClassNames } from "./robloxClasses";
-import { isScriptClass } from "./utils";
+import { isScriptClass, scriptIconClass } from "./utils";
 import { getThemeCssBlock, getThemeScriptBlock, getThemeStyleAttribute } from "./webviewTheme";
 
 type WebviewNode = {
   id: string;
   name: string;
   className: string;
+  iconClassName: string;
   children: string[];
   isScript: boolean;
   disabled?: boolean;
@@ -133,6 +134,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         id: n.id,
         name: n.name,
         className: n.className,
+        iconClassName: scriptIconClass(n.className, n.runContext),
         children: sorted.map(c => c.id),
         isScript,
       };
@@ -566,7 +568,7 @@ function buildRowHtml(id,depth,h){
   }
   h.push('<div class="'+rowClass+'" data-id="'+id+'" data-s="'+(n.isScript?1:0)+'" data-disabled="'+(disabled?1:0)+'" draggable="'+(depth>0?'true':'false')+'" style="'+style+'">');
   h.push('<span class="tree-arrow'+ac+'"></span>');
-  h.push('<img class="tree-icon" src="'+ASSET+'/'+esc(n.className)+'.png"'+(disabled?' style="opacity:.45"':'')+'>');
+  h.push('<img class="tree-icon" src="'+ASSET+'/'+esc(n.iconClassName||n.className)+'.png"'+(disabled?' style="opacity:.45"':'')+'>');
   h.push('<span class="tree-name-group">');
   if(id===renameNodeId){
     h.push('<input class="tree-rename-input" type="text" value="'+esc(n.name)+'" data-id="'+id+'">');

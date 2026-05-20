@@ -270,7 +270,7 @@ local function _listenToChanges(client: Client, descendant: Instance)
 	end
 
 	if descendant:IsA("BaseScript") then
-		for _, propName in ipairs({ "Enabled", "Disabled" }) do
+		for _, propName in ipairs({ "Enabled", "Disabled", "RunContext" }) do
 			table.insert(
 				connections,
 				descendant:GetPropertyChangedSignal(propName):Connect(function()
@@ -280,6 +280,7 @@ local function _listenToChanges(client: Client, descendant: Instance)
 						timestamp = tick(),
 						id = descendant:GetDebugId(0),
 						disabled = not bs.Enabled,
+						runContext = bs.RunContext.Name,
 					})
 				end)
 			)
