@@ -340,6 +340,7 @@ window.addEventListener('message',function(e){
     case 'updateTree':
       nodes=m.nodes||{};rootIds=m.rootIds||[];
       selectedIds=m.selectedIds||selectedIds;
+      for(var k in nodes){var nn=nodes[k];nn._nl=nn.name.toLowerCase();nn._cl=nn.className.toLowerCase()}
       renderTree();break;
     case 'updateSelection':
       selectedIds=m.selectedIds||[];updateSelVis();break;
@@ -373,14 +374,23 @@ window.addEventListener('message',function(e){
 });
 
 /* ---- search ---- */
-searchEl.addEventListener('input',function(){searchFilter=searchEl.value.trim().toLowerCase();renderTree()});
+var searchDebounce=null;
+searchEl.addEventListener('input',function(){
+  var raw=searchEl.value.trim().toLowerCase();
+  if(searchDebounce)clearTimeout(searchDebounce);
+  if(!raw){searchFilter='';renderTree();return}
+  searchDebounce=setTimeout(function(){searchFilter=raw;renderTree()},50);
+});
+searchEl.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault()}
+});
 
 var visCache={};
 function isVis(id){
   if(id in visCache)return visCache[id];
   var n=nodes[id];
   if(!n)return(visCache[id]=false);
-  if(n.name.toLowerCase().indexOf(searchFilter)>=0||n.className.toLowerCase().indexOf(searchFilter)>=0)return(visCache[id]=true);
+  if(n._nl.indexOf(searchFilter)>=0||n._cl.indexOf(searchFilter)>=0)return(visCache[id]=true);
   for(var i=0;i<n.children.length;i++){if(isVis(n.children[i]))return(visCache[id]=true)}
   return(visCache[id]=false);
 }
@@ -414,18 +424,57 @@ function afterRenameInputMount(){
   inp.addEventListener('click',function(ev){ev.stopPropagation()});
 }
 
-/* ---- tree rendering ---- */
-function renderTree(){
+/* ---- tree rendering (virtual scroll) ---- */
+var ROW_HEIGHT=22;
+var OVERSCAN=10;
+var flatRows=[];
+var vLastStart=-1,vLastEnd=-1;
+var scrollRaf=false;
+
+function buildFlatRows(){
   visCache={};
-  var h=[];
-  for(var i=0;i<rootIds.length;i++)buildRow(rootIds[i],0,h);
+  flatRows=[];
+  function walk(id,depth){
+    if(searchFilter&&!isVis(id))return;
+    var n=nodes[id];if(!n)return;
+    var has=n.children.length>0;
+    var exp=searchFilter?has:expandedIds.has(id);
+    flatRows.push({id:id,depth:depth});
+    if(exp)for(var i=0;i<n.children.length;i++)walk(n.children[i],depth+1);
+  }
+  for(var i=0;i<rootIds.length;i++)walk(rootIds[i],0);
+}
+
+function renderTree(){
+  buildFlatRows();
+  vLastStart=-1;vLastEnd=-1;
+  renderViewport();
+  if(renameNodeId)afterRenameInputMount();
+}
+
+var INDENT=12;
+var LINE_COLOR='var(--vscode-tree-indentGuidesStroke)';
+
+function renderViewport(){
+  var scrollTop=treeEl.scrollTop;
+  var viewH=treeEl.clientHeight||400;
+  var start=Math.max(0,Math.floor(scrollTop/ROW_HEIGHT)-OVERSCAN);
+  var end=Math.min(flatRows.length,Math.ceil((scrollTop+viewH)/ROW_HEIGHT)+OVERSCAN);
+  if(start===vLastStart&&end===vLastEnd)return;
+  vLastStart=start;vLastEnd=end;
+  var topPad=start*ROW_HEIGHT;
+  var bottomPad=Math.max(0,(flatRows.length-end)*ROW_HEIGHT);
+  var h=['<div style="padding-top:'+topPad+'px;padding-bottom:'+bottomPad+'px">'];
+  for(var i=start;i<end;i++){
+    var r=flatRows[i];
+    buildRowHtml(r.id,r.depth,h);
+  }
+  h.push('</div>');
   treeEl.innerHTML=h.join('');
   if(renameNodeId)afterRenameInputMount();
 }
-var INDENT=12;
-var LINE_COLOR='var(--vscode-tree-indentGuidesStroke)';
-function buildRow(id,depth,h){
-  if(searchFilter&&!isVis(id))return;
+
+function buildRowHtml(id,depth,h){
   var n=nodes[id];if(!n)return;
   var has=n.children.length>0;
   var exp=searchFilter?has:expandedIds.has(id);
@@ -455,16 +504,32 @@ function buildRow(id,depth,h){
   }
   h.push('<button class="tree-add-btn">+</button>');
   h.push('</span></div>');
-  if(exp)for(var i=0;i<n.children.length;i++)buildRow(n.children[i],depth+1,h);
 }
+
+treeEl.addEventListener('scroll',function(){
+  if(scrollRaf)return;
+  scrollRaf=true;
+  requestAnimationFrame(function(){scrollRaf=false;renderViewport()});
+});
 
 /* ---- selection ---- */
 function updateSelVis(){
   treeEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.toggle('selected',selectedIds.indexOf(r.dataset.id)>=0)});
 }
 function scrollTo(id){
-  var el=treeEl.querySelector('[data-id="'+id+'"]');
-  if(el)el.scrollIntoView({block:'nearest'});
+  for(var i=0;i<flatRows.length;i++){
+    if(flatRows[i].id===id){
+      var targetTop=i*ROW_HEIGHT;
+      var viewH=treeEl.clientHeight||400;
+      var scrollTop=treeEl.scrollTop;
+      if(targetTop<scrollTop||targetTop+ROW_HEIGHT>scrollTop+viewH){
+        treeEl.scrollTop=targetTop-Math.floor(viewH/2)+ROW_HEIGHT;
+      }
+      vLastStart=-1;vLastEnd=-1;
+      renderViewport();
+      return;
+    }
+  }
 }
 
 /* ---- tree events ---- */
