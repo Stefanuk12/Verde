@@ -3,7 +3,7 @@
   "publisher": "Dvitash",
   "displayName": "Verde",
   "description": "A VS Code extension for exploring and editing Roblox game instances",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -275,7 +275,9 @@
     "lint": "eslint src",
     "test": "vscode-test",
     "package": "vsce package",
-    "publish": "vsce publish"
+    "publish:vsce": "node scripts/publish.js vsce",
+    "publish:ovsx": "node scripts/publish.js ovsx",
+    "publish": "npm run publish:vsce && npm run publish:ovsx"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
