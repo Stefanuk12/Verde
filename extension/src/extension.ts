@@ -258,6 +258,12 @@ export async function activate(context: vscode.ExtensionContext) {
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand("verde.collapseAll", () => {
+			explorerViewProvider.collapseAll();
+		})
+	);
+
+	context.subscriptions.push(
 		vscode.commands.registerCommand("verde.showOutput", () => {
 			outputChannel.show(true);
 		})

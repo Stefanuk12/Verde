@@ -51,6 +51,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "updateClasses", classes: getClassNames() });
   }
 
+  public collapseAll(): void {
+    this.post({ type: "collapseAll" });
+  }
+
   public reveal(node: Node): void {
     const ancestors: string[] = [];
     let cur: Node | undefined = node;
@@ -83,11 +87,17 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.onDidReceiveMessage(m => this.onMessage(m));
     webviewView.onDidDispose(() => { this.webviewView = undefined; });
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration("verde.coloredSelection") || e.affectsConfiguration("verde.coloredSelectionColor")) {
+        this.pushSelectionColor();
+      }
+    });
     const assetBase = webviewView.webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "assets")
     ).toString();
     webviewView.webview.html = this.buildHtml(webviewView.webview, assetBase);
     this.pushTree();
+    this.pushSelectionColor();
   }
 
   public refreshWebviewHtml(): void {
@@ -101,6 +111,15 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
   private post(msg: unknown): void {
     this.webviewView?.webview.postMessage(msg);
+  }
+
+  private pushSelectionColor(): void {
+    const cfg = vscode.workspace.getConfiguration("verde");
+    this.post({
+      type: "updateSelectionColor",
+      enabled: cfg.get<boolean>("coloredSelection", false),
+      color: cfg.get<string>("coloredSelectionColor", "#264f78"),
+    });
   }
 
   private pushTree(): void {
@@ -289,6 +308,7 @@ body{display:flex;flex-direction:column}
 .qa-item:not(.selected):hover{background:var(--vscode-list-hoverBackground)}
 .qa-icon{width:16px;height:16px;margin-right:8px;image-rendering:pixelated;flex-shrink:0}
 </style>
+<style id="sel-override"></style>
 ${themeScript}
 </head>
 <body>
@@ -314,13 +334,19 @@ var searchFilter='';
 var qaParentId=null,qaFiltered=CLASSES,qaIdx=0,qaOutsideClick=null;
 var ctxNodeId=null;
 var renameNodeId=null;
+var SLOW_CLICK_RENAME_DELAY=800;
+var DBLCLICK_THRESHOLD=400;
+var slowClickTimer=null;
+var lastClickTime=0,lastClickId=null;
 
 var expandedIds=new Set();
+var searchExpandedIds=new Set();
+var savedExpandedIds=null;
 var dragSourceId=null;
 var saved=vscode.getState();
 if(saved&&Array.isArray(saved.exp))expandedIds=new Set(saved.exp);
-function saveExp(){vscode.setState({exp:[...expandedIds]})}
-
+function activeExp(){return searchFilter?searchExpandedIds:expandedIds}
+function saveExp(){if(!searchFilter)vscode.setState({exp:[...expandedIds]})}
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
 var treeEl=document.getElementById('tree');
@@ -370,19 +396,64 @@ window.addEventListener('message',function(e){
         }
       }
       break;
+    case 'updateSelectionColor':
+      var so=document.getElementById('sel-override');
+      if(so){
+        if(m.enabled&&m.color){
+          so.textContent='.tree-row.selected{background:'+m.color+' !important}#tree:focus-within .tree-row.selected{background:'+m.color+' !important}';
+        }else{so.textContent=''}
+      }
+      break;
+    case 'collapseAll':
+      expandedIds.clear();
+      searchExpandedIds.clear();
+      savedExpandedIds=null;
+      for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
+      saveExp();renderTree();
+      if(selectedIds.length>0)requestAnimationFrame(function(){scrollTo(selectedIds[0])});
+      break;
   }
 });
 
 /* ---- search ---- */
 var searchDebounce=null;
+function expandSearchMatches(){
+  visCache={};
+  searchExpandedIds=new Set(expandedIds);
+  function walk(id){
+    var n=nodes[id];if(!n)return;
+    if(!isVis(id))return;
+    if(n.children.length>0)searchExpandedIds.add(id);
+    for(var i=0;i<n.children.length;i++)walk(n.children[i]);
+  }
+  for(var i=0;i<rootIds.length;i++)walk(rootIds[i]);
+}
+function expandAncestors(id){
+  var n=nodes[id];if(!n)return;
+  for(var k in nodes){
+    var p=nodes[k];
+    if(p.children.indexOf(id)>=0){expandedIds.add(k);expandAncestors(k);return}
+  }
+}
 searchEl.addEventListener('input',function(){
   var raw=searchEl.value.trim().toLowerCase();
   if(searchDebounce)clearTimeout(searchDebounce);
-  if(!raw){searchFilter='';renderTree();return}
-  searchDebounce=setTimeout(function(){searchFilter=raw;renderTree()},50);
+  if(!raw){
+    if(savedExpandedIds){expandedIds=savedExpandedIds;savedExpandedIds=null}
+    for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
+    saveExp();
+    searchFilter='';renderTree();return;
+  }
+  if(!savedExpandedIds)savedExpandedIds=new Set(expandedIds);
+  searchDebounce=setTimeout(function(){searchFilter=raw;expandSearchMatches();renderTree()},50);
 });
 searchEl.addEventListener('keydown',function(e){
-  if(e.key==='Escape'){searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault()}
+  if(e.key==='Escape'){
+    if(savedExpandedIds){expandedIds=savedExpandedIds;savedExpandedIds=null}
+    for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
+    saveExp();
+    searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault();
+  }
 });
 
 var visCache={};
@@ -438,7 +509,7 @@ function buildFlatRows(){
     if(searchFilter&&!isVis(id))return;
     var n=nodes[id];if(!n)return;
     var has=n.children.length>0;
-    var exp=searchFilter?has:expandedIds.has(id);
+    var exp=activeExp().has(id);
     flatRows.push({id:id,depth:depth});
     if(exp)for(var i=0;i<n.children.length;i++)walk(n.children[i],depth+1);
   }
@@ -477,7 +548,7 @@ function renderViewport(){
 function buildRowHtml(id,depth,h){
   var n=nodes[id];if(!n)return;
   var has=n.children.length>0;
-  var exp=searchFilter?has:expandedIds.has(id);
+  var exp=activeExp().has(id);
   var sel=selectedIds.indexOf(id)>=0;
   var pad=depth*INDENT;
   var ac=has?(exp?' expanded':''):' leaf';
@@ -535,28 +606,48 @@ function scrollTo(id){
 /* ---- tree events ---- */
 treeEl.addEventListener('click',function(e){
   treeEl.focus();
+  if(slowClickTimer){clearTimeout(slowClickTimer);slowClickTimer=null}
   var row=e.target.closest('.tree-row');
-  if(!row){selectedIds=[];updateSelVis();vscode.postMessage({type:'selectionChanged',nodeIds:[]});return}
+  if(!row){lastClickId=null;selectedIds=[];updateSelVis();vscode.postMessage({type:'selectionChanged',nodeIds:[]});return}
   var id=row.dataset.id;
   var arrow=e.target.closest('.tree-arrow');
   if(arrow&&!arrow.classList.contains('leaf')){
-    if(expandedIds.has(id))expandedIds.delete(id);else expandedIds.add(id);
+    lastClickId=null;
+    var ae=activeExp();if(ae.has(id))ae.delete(id);else ae.add(id);
     saveExp();renderTree();return;
   }
-  if(e.target.closest('.tree-add-btn')){openQA(id,row);return}
+  if(e.target.closest('.tree-add-btn')){lastClickId=null;openQA(id,row);return}
+  var now=Date.now();
+  var isDbl=id===lastClickId&&now-lastClickTime<DBLCLICK_THRESHOLD&&!e.ctrlKey&&!e.metaKey;
+  lastClickTime=now;
+  lastClickId=id;
+  if(isDbl){
+    lastClickId=null;
+    if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id});return}
+    var node=nodes[id];
+    if(node&&node.children.length>0){
+      var ae=activeExp();if(ae.has(id))ae.delete(id);else ae.add(id);
+      saveExp();renderTree();
+    }
+    return;
+  }
   if(e.ctrlKey||e.metaKey){var i=selectedIds.indexOf(id);if(i>=0)selectedIds.splice(i,1);else selectedIds.push(id)}
-  else selectedIds=[id];
+  else{
+    var wasOnlySel=selectedIds.length===1&&selectedIds[0]===id;
+    selectedIds=[id];
+    if(wasOnlySel&&!renameNodeId){
+      slowClickTimer=setTimeout(function(){slowClickTimer=null;renameNodeId=id;renderTree();afterRenameInputMount()},SLOW_CLICK_RENAME_DELAY);
+    }
+  }
   updateSelVis();
   vscode.postMessage({type:'selectionChanged',nodeIds:selectedIds.slice()});
 });
 
-treeEl.addEventListener('dblclick',function(e){
-  var row=e.target.closest('.tree-row');
-  if(!row||e.target.closest('.tree-arrow')||e.target.closest('.tree-add-btn'))return;
-  if(row.dataset.s==='1')vscode.postMessage({type:'scriptActivated',nodeId:row.dataset.id});
-});
+treeEl.addEventListener('dblclick',function(e){e.preventDefault()});
 
 treeEl.addEventListener('contextmenu',function(e){
+  if(slowClickTimer){clearTimeout(slowClickTimer);slowClickTimer=null}
+  lastClickId=null;
   e.preventDefault();
   var row=e.target.closest('.tree-row');if(!row)return;
   var id=row.dataset.id;
@@ -567,6 +658,8 @@ treeEl.addEventListener('contextmenu',function(e){
 /* ---- drag and drop ---- */
 function clearDragOver(){treeEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('drag-over')})}
 treeEl.addEventListener('dragstart',function(e){
+  if(slowClickTimer){clearTimeout(slowClickTimer);slowClickTimer=null}
+  lastClickId=null;
   if(e.target.closest('.tree-arrow,.tree-add-btn,.tree-rename-input')){e.preventDefault();return}
   var row=e.target.closest('.tree-row');if(!row)return;
   dragSourceId=row.dataset.id;

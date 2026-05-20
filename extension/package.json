@@ -48,6 +48,16 @@
           "type": "boolean",
           "default": true,
           "description": "When enabled, Ctrl+P opens the Go to Instance menu instead of VS Code's Quick Open (only when the Verde explorer is focused)"
+        },
+        "verde.coloredSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use a custom color for selected items in the explorer tree"
+        },
+        "verde.coloredSelectionColor": {
+          "type": "string",
+          "default": "#264f78",
+          "description": "Background color for selected items when Colored Selection is enabled"
         }
       }
     },
@@ -79,6 +89,12 @@
         "command": "verde.refreshExplorer",
         "title": "Refresh",
         "icon": "$(refresh)",
+        "category": "Verde"
+      },
+      {
+        "command": "verde.collapseAll",
+        "title": "Collapse All",
+        "icon": "$(collapse-all)",
         "category": "Verde"
       },
       {
@@ -239,6 +255,11 @@
       "view/title": [
         {
           "command": "verde.refreshExplorer",
+          "when": "view == verde.view",
+          "group": "navigation"
+        },
+        {
+          "command": "verde.collapseAll",
           "when": "view == verde.view",
           "group": "navigation"
         }
