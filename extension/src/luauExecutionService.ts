@@ -8,11 +8,9 @@ export interface ExecuteLuauOptions {
 	nodeId?: string;
 }
 
-export interface ExecuteLuauResult {
-	success: boolean;
-	data?: unknown;
-	error?: string;
-}
+export type ExecuteLuauResult =
+	| { success: true; data?: unknown }
+	| { success: false; error: string };
 
 type Consent = "always" | "session" | "denied";
 
@@ -119,7 +117,7 @@ export class LuauExecutionService {
 						`This grants the extension full Studio plugin access - file system, HTTP, ` +
 						`and the ability to modify your place. Only allow extensions you trust.${detail}`,
 					{ modal: true },
-					"Allow Once",
+					"Allow for Session",
 					"Always Allow",
 				);
 
@@ -130,7 +128,7 @@ export class LuauExecutionService {
 					}
 					return "always";
 				}
-				if (choice === "Allow Once") {
+				if (choice === "Allow for Session") {
 					this.sessionConsent.add(extensionId);
 					return "session";
 				}
