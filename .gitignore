@@ -8,3 +8,10 @@ package-lock.json
 *.code-workspace
 scripts/
 .env
+
+.direnv/
+result
+result-*
+
+plugin/*.rbxm
+plugin/*.rbxmx

@@ -58,6 +58,11 @@
           "type": "string",
           "default": "#264f78",
           "description": "Background color for selected items when Colored Selection is enabled"
+        },
+        "verde.allowExtensionScripting": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow third-party extensions to execute Luau code inside Roblox Studio via Verde's API. Each extension is prompted for consent on first use. Disable to block all extension-initiated scripting."
         }
       }
     },

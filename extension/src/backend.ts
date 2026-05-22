@@ -23,11 +23,12 @@ export type Operation =
     | { type: "stop_sound"; nodeId: string }
     | { type: "set_sound_time_position"; nodeId: string; timePosition: number }
     | { type: "get_sound_playback_info" }
+    | { type: "execute_luau"; code: string; description?: string; nodeId?: string; extensionId?: string }
     | { type: "undo" }
     | { type: "redo" }
 
 export type OperationResult =
-    | { success: true; data?: string | PropertiesData | boolean }
+    | { success: true; data?: unknown }
     | { success: false; error: string };
 
 export type PropertyInfo = {

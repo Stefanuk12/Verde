@@ -7,6 +7,8 @@ import { getClassNames, initClassNames } from "./robloxClasses";
 import { SourcemapParser } from "./sourcemapParser";
 import { isScriptClass } from "./utils";
 import { InstanceHistory, HistoryEntry } from "./instanceHistory";
+import { ContextMenuRegistry, VerdeApi } from "./contextMenuRegistry";
+import { LuauExecutionService } from "./luauExecutionService";
 
 import * as fzy from "fzy.js";
 
@@ -18,7 +20,7 @@ let instanceHistory: InstanceHistory;
 let cachedQuickPickItems: (vscode.QuickPickItem & { node: Node })[] = [];
 let cachedSearchStrings: string[] = [];
 
-export async function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext): Promise<VerdeApi> {
 	const outputChannel = vscode.window.createOutputChannel("Verde Backend");
 	const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 
@@ -102,7 +104,9 @@ export async function activate(context: vscode.ExtensionContext) {
 		})
 	);
 
-	explorerViewProvider = new ExplorerViewProvider(context.extensionUri, explorerProvider, backend);
+	const contextMenuRegistry = new ContextMenuRegistry();
+	const luauExecutionService = new LuauExecutionService(backend, context.globalState);
+	explorerViewProvider = new ExplorerViewProvider(context.extensionUri, explorerProvider, backend, contextMenuRegistry);
 	backend.setPropertyUpdateCallback(syncScriptDisabledState);
 
 	context.subscriptions.push(
@@ -804,6 +808,11 @@ export async function activate(context: vscode.ExtensionContext) {
 			outputChannel.show(true);
 		}
 	}
+
+	return {
+		registerContextMenuItem: (item) => contextMenuRegistry.register(item),
+		executeLuau: (opts) => luauExecutionService.execute(opts),
+	};
 }
 
 export async function deactivate() {
