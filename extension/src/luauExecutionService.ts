@@ -66,7 +66,8 @@ export class LuauExecutionService {
 		});
 
 		if (result.success) {
-			return { success: true, data: result.data };
+			const wrapper = result.data as { value?: unknown } | undefined;
+			return { success: true, data: wrapper?.value };
 		}
 		return { success: false, error: result.error };
 	}
