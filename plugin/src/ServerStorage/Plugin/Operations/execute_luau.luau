@@ -10,12 +10,27 @@ type Payload = {
 	extensionId: string?,
 }
 
+local function _sanitizeId(raw: string?): string
+	if not raw or raw == "" then
+		return "extension"
+	end
+	local cleaned = (raw:gsub("[%c\r\n]", ""))
+	cleaned = (cleaned:gsub("^%s+", ""):gsub("%s+$", ""))
+	if cleaned == "" then
+		return "extension"
+	end
+	if #cleaned > 128 then
+		cleaned = cleaned:sub(1, 128)
+	end
+	return cleaned
+end
+
 return function(payload: Payload): (any, string?)
 	if type(payload.code) ~= "string" or payload.code == "" then
 		return false, "execute_luau: missing code"
 	end
 
-	local extensionId = payload.extensionId or "extension"
+	local extensionId = _sanitizeId(payload.extensionId)
 	local description = payload.description or `Verde: {extensionId}`
 
 	local selection: Instance? = nil
@@ -63,19 +78,14 @@ return function(payload: Payload): (any, string?)
 
 	ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
 
-	-- Connected.luau's dispatcher treats `nil` and `false` from an operation as
-	-- failure, so when the user script returns nothing (or `false`) we surface
-	-- a plain `true` to mean "ran successfully, no data".
-	if userResult == nil or userResult == false then
-		return true
+	if userResult ~= nil then
+		local encodeOk, encodeErr = pcall(function()
+			HttpService:JSONEncode(userResult)
+		end)
+		if not encodeOk then
+			return false, `execute_luau: return value not JSON-serializable: {tostring(encodeErr)}`
+		end
 	end
 
-	local encodeOk, encodeErr = pcall(function()
-		HttpService:JSONEncode(userResult)
-	end)
-	if not encodeOk then
-		return false, `execute_luau: return value not JSON-serializable: {tostring(encodeErr)}`
-	end
-
-	return userResult
+	return { value = userResult }
 end
