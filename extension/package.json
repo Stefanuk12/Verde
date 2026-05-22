@@ -168,6 +168,11 @@
         "category": "Verde"
       },
       {
+        "command": "verde.revokeLuauConsent",
+        "title": "Revoke Luau Execution Consent",
+        "category": "Verde"
+      },
+      {
         "command": "verde.goToInstance",
         "title": "Go to Instance",
         "category": "Verde"

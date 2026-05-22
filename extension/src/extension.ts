@@ -797,6 +797,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		return false;
 	}
 
+	context.subscriptions.push(
+		vscode.commands.registerCommand("verde.revokeLuauConsent", async () => {
+			type RevokePick = vscode.QuickPickItem & { revokeAll?: true; extensionId?: string };
+
+			const ids = luauExecutionService.listConsentedExtensions();
+			if (ids.length === 0) {
+				vscode.window.showInformationMessage("Verde: no extensions currently have Luau execution consent.");
+				return;
+			}
+
+			const picks: RevokePick[] = [
+				{ label: "$(trash) Revoke all", description: `${ids.length} extension(s)`, revokeAll: true },
+				{ label: "", kind: vscode.QuickPickItemKind.Separator },
+				...ids.map((id): RevokePick => {
+					const ext = vscode.extensions.getExtension(id);
+					const displayName =
+						(ext?.packageJSON as { displayName?: string } | undefined)?.displayName ||
+						(ext?.packageJSON as { name?: string } | undefined)?.name ||
+						id;
+					return { label: displayName, description: id, extensionId: id };
+				}),
+			];
+
+			const choice = await vscode.window.showQuickPick<RevokePick>(picks, {
+				placeHolder: "Revoke 'Always Allow' for which extension?",
+				canPickMany: false,
+			});
+			if (!choice) {
+				return;
+			}
+
+			if (choice.revokeAll) {
+				const confirm = await vscode.window.showWarningMessage(
+					`Revoke Luau execution consent for all ${ids.length} extension(s)?`,
+					{ modal: true },
+					"Revoke all",
+				);
+				if (confirm !== "Revoke all") {
+					return;
+				}
+				await luauExecutionService.revokeAllConsents();
+				vscode.window.showInformationMessage(`Verde: revoked Luau consent for ${ids.length} extension(s).`);
+				return;
+			}
+
+			if (choice.extensionId) {
+				await luauExecutionService.revokeConsent(choice.extensionId);
+				vscode.window.showInformationMessage(`Verde: revoked Luau consent for "${choice.label}".`);
+			}
+		})
+	);
+
 	const config = vscode.workspace.getConfiguration("verde");
 	const autoStart = config.get<boolean>("autoStart", true);
 
