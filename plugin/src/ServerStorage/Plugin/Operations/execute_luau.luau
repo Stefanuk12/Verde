@@ -26,7 +26,7 @@ return function(payload: Payload): (any, string?)
 		end
 	end
 
-	local wrapped = `return function(ctx){payload.code}\nend`
+	local wrapped = `return function(ctx)\n{payload.code}\nend`
 	local loader, loadError = loadstring(wrapped, `=verde: {extensionId}`)
 	if not loader then
 		return false, `execute_luau: compile failed: {tostring(loadError)}`
@@ -63,6 +63,9 @@ return function(payload: Payload): (any, string?)
 
 	ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
 
+	-- Connected.lua's dispatcher treats `nil` and `false` from an operation as
+	-- failure, so when the user script returns nothing (or `false`) we surface
+	-- a plain `true` to mean "ran successfully, no data".
 	if userResult == nil or userResult == false then
 		return true
 	end
