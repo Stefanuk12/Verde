@@ -104,7 +104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		})
 	);
 
-	const contextMenuRegistry = new ContextMenuRegistry();
+	const contextMenuRegistry = new ContextMenuRegistry(outputChannel);
 	const luauExecutionService = new LuauExecutionService(backend, context.globalState);
 	explorerViewProvider = new ExplorerViewProvider(context.extensionUri, explorerProvider, backend, contextMenuRegistry);
 	backend.setPropertyUpdateCallback(syncScriptDisabledState);

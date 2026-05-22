@@ -98,6 +98,8 @@ const BUILT_IN_IDS: ReadonlySet<string> = new Set(
 export class ContextMenuRegistry {
   private items: Map<string, VerdeContextMenuItem> = new Map();
 
+  constructor(private readonly outputChannel: vscode.OutputChannel) {}
+
   public register(item: VerdeContextMenuItem): vscode.Disposable {
     if (!item.id || !item.label || !item.command) {
       throw new Error(
@@ -123,7 +125,7 @@ export class ContextMenuRegistry {
   public itemsFor(node: Node): SerializedContextMenuItem[] {
     const all = [...BUILT_IN_ITEMS, ...this.items.values()];
     return all
-      .filter((it) => !it.when || safeWhen(it, node))
+      .filter((it) => !it.when || this.safeWhen(it, node))
       .map((it) => ({
         id: it.id,
         label: it.label,
@@ -141,14 +143,16 @@ export class ContextMenuRegistry {
         return a.label < b.label ? -1 : 1;
       });
   }
-}
 
-function safeWhen(item: VerdeContextMenuItem, node: Node): boolean {
-  try {
-    return !!item.when!(node);
-  } catch (err) {
-    console.error(`Verde context menu item "${item.id}" when() threw:`, err);
-    return false;
+  private safeWhen(item: VerdeContextMenuItem, node: Node): boolean {
+    try {
+      return !!item.when!(node);
+    } catch (err) {
+      this.outputChannel.appendLine(
+        `[verde] context menu item "${item.id}" when() threw: ${String(err)}`,
+      );
+      return false;
+    }
   }
 }
 
