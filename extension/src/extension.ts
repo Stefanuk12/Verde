@@ -809,7 +809,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 			const picks: RevokePick[] = [
 				{ label: "$(trash) Revoke all", description: `${ids.length} extension(s)`, revokeAll: true },
-				{ label: "", kind: vscode.QuickPickItemKind.Separator },
+				{ label: "Individual extensions", kind: vscode.QuickPickItemKind.Separator },
 				...ids.map((id): RevokePick => {
 					const ext = vscode.extensions.getExtension(id);
 					const displayName =
