@@ -1,5 +1,5 @@
 {
-  description = "Verde  VS Code extension + Roblox Studio plugin";
+  description = "Verde - VS Code extension + Roblox Studio plugin";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
