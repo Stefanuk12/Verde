@@ -95,6 +95,10 @@ const BUILT_IN_IDS: ReadonlySet<string> = new Set(
   BUILT_IN_ITEMS.map((it) => it.id),
 );
 
+const RESERVED_GROUPS: ReadonlySet<string> = new Set(
+  BUILT_IN_ITEMS.map((it) => it.group!).filter((g): g is string => !!g),
+);
+
 export class ContextMenuRegistry {
   private items: Map<string, VerdeContextMenuItem> = new Map();
 
@@ -109,6 +113,11 @@ export class ContextMenuRegistry {
     if (BUILT_IN_IDS.has(item.id)) {
       throw new Error(
         `Verde context menu item id "${item.id}" collides with a built-in item.`,
+      );
+    }
+    if (item.group !== undefined && RESERVED_GROUPS.has(item.group)) {
+      throw new Error(
+        `Verde context menu item "${item.id}" uses reserved group "${item.group}". Use a group starting with "5_" or later.`,
       );
     }
     if (this.items.has(item.id)) {

@@ -39,6 +39,22 @@ export class LuauExecutionService {
 		}
 
 		const extensionId = options.extension.id;
+
+		const registered = vscode.extensions.getExtension(extensionId);
+		if (!registered || registered !== options.extension) {
+			return {
+				success: false,
+				error: "executeLuau: extension reference does not match the registered extension for this id (pass your own context.extension)",
+			};
+		}
+
+		if (!vscode.workspace.isTrusted) {
+			return {
+				success: false,
+				error: "Luau execution is disabled in untrusted workspaces. Mark this workspace as trusted to continue.",
+			};
+		}
+
 		const displayName = readDisplayName(options.extension);
 		const safeDescription = sanitizeText(options.description, MAX_DESCRIPTION_LEN);
 
@@ -49,6 +65,13 @@ export class LuauExecutionService {
 			return {
 				success: false,
 				error: "Luau execution is disabled. Enable 'verde.allowExtensionScripting' in settings.",
+			};
+		}
+
+		if (!this.backend.hasConnectedClient()) {
+			return {
+				success: false,
+				error: "Roblox Studio is not connected to Verde.",
 			};
 		}
 

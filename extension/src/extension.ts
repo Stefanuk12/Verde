@@ -807,8 +807,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				return;
 			}
 
+			const noun = ids.length === 1 ? "extension" : "extensions";
 			const picks: RevokePick[] = [
-				{ label: "$(trash) Revoke all", description: `${ids.length} extension(s)`, revokeAll: true },
+				{ label: "$(trash) Revoke all", description: `${ids.length} ${noun}`, revokeAll: true },
 				{ label: "Individual extensions", kind: vscode.QuickPickItemKind.Separator },
 				...ids.map((id): RevokePick => {
 					const ext = vscode.extensions.getExtension(id);
@@ -830,7 +831,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 			if (choice.revokeAll) {
 				const confirm = await vscode.window.showWarningMessage(
-					`Revoke Luau execution consent for all ${ids.length} extension(s)?`,
+					`Revoke Luau execution consent for all ${ids.length} ${noun}?`,
 					{ modal: true },
 					"Revoke all",
 				);
@@ -838,7 +839,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 					return;
 				}
 				await luauExecutionService.revokeAllConsents();
-				vscode.window.showInformationMessage(`Verde: revoked Luau consent for ${ids.length} extension(s).`);
+				vscode.window.showInformationMessage(`Verde: revoked Luau consent for ${ids.length} ${noun}.`);
 				return;
 			}
 

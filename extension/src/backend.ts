@@ -218,6 +218,10 @@ export class VerdeBackend {
         }
     }
 
+    public hasConnectedClient(): boolean {
+        return this.clients.size > 0;
+    }
+
     public async sendOperation(operation: Operation): Promise<OperationResult> {
         return new Promise((resolve) => {
             const operationId = crypto.randomUUID();
