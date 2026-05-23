@@ -4,6 +4,7 @@ import { VerdeBackend } from "./backend";
 import { getClassNames } from "./robloxClasses";
 import { isScriptClass, scriptIconClass } from "./utils";
 import { getThemeCssBlock, getThemeScriptBlock, getThemeStyleAttribute } from "./webviewTheme";
+import { ContextMenuRegistry } from "./contextMenuRegistry";
 
 type WebviewNode = {
   id: string;
@@ -26,6 +27,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     private readonly extensionUri: vscode.Uri,
     private readonly explorerProvider: RobloxExplorerProvider,
     private readonly backend: VerdeBackend,
+    private readonly contextMenuRegistry: ContextMenuRegistry,
   ) {
     this.explorerProvider.onChange(() => this.pushTree());
   }
@@ -175,16 +177,27 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       }
       case "runCommand": {
         const node = msg.nodeId ? this.explorerProvider.getNodeById(msg.nodeId) : undefined;
-        if (node) {
-          vscode.commands.executeCommand(msg.command, node);
-        } else {
-          vscode.commands.executeCommand(msg.command);
-        }
+        const exec = node
+          ? vscode.commands.executeCommand(msg.command, node)
+          : vscode.commands.executeCommand(msg.command);
+        Promise.resolve(exec).then(undefined, (err) => {
+          vscode.window.showErrorMessage(`Command "${msg.command}" failed: ${String(err)}`);
+        });
         break;
       }
       case "scriptActivated": {
         const node = this.explorerProvider.getNodeById(msg.nodeId);
         if (node) vscode.commands.executeCommand("verde.openScript", node);
+        break;
+      }
+      case "requestContextMenu": {
+        const node = msg.nodeId ? this.explorerProvider.getNodeById(msg.nodeId) : undefined;
+        if (!node) {
+          this.post({ type: "showContextMenu", requestId: msg.requestId, nodeId: msg.nodeId, items: [] });
+          break;
+        }
+        const items = this.contextMenuRegistry.itemsFor(node);
+        this.post({ type: "showContextMenu", requestId: msg.requestId, nodeId: node.id, items });
         break;
       }
       case "reparentNode": {
@@ -413,6 +426,11 @@ window.addEventListener('message',function(e){
       for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
       saveExp();renderTree();
       if(selectedIds.length>0)requestAnimationFrame(function(){scrollTo(selectedIds[0])});
+      break;
+    case 'showContextMenu':
+      if(!ctxPending||m.requestId!==ctxPending.id)break;
+      var p=ctxPending;ctxPending=null;
+      showCtx(p.x,p.y,p.nodeId,m.items||[]);
       break;
   }
 });
@@ -654,7 +672,7 @@ treeEl.addEventListener('contextmenu',function(e){
   var row=e.target.closest('.tree-row');if(!row)return;
   var id=row.dataset.id;
   if(selectedIds.indexOf(id)<0){selectedIds=[id];updateSelVis();vscode.postMessage({type:'selectionChanged',nodeIds:[id]})}
-  showCtx(e.clientX,e.clientY,id,row.dataset.s==='1');
+  requestCtx(e.clientX,e.clientY,id);
 });
 
 /* ---- drag and drop ---- */
@@ -698,25 +716,20 @@ treeEl.addEventListener('drop',function(e){
 });
 
 /* ---- context menu ---- */
-function showCtx(x,y,id,isScript){
+var ctxReqSeq=0;var ctxPending=null;
+function requestCtx(x,y,id){
+  ctxPending={id:++ctxReqSeq,x:x,y:y,nodeId:id};
+  vscode.postMessage({type:'requestContextMenu',requestId:ctxPending.id,nodeId:id});
+}
+function showCtx(x,y,id,items){
+  if(!items||items.length===0){hideCtx();return}
   ctxNodeId=id;
-  var items=[
-    {l:'Rename',c:'verde.renameInstance'},
-    {l:'Duplicate',c:'verde.duplicateInstance'},
-    {l:'Delete',c:'verde.deleteInstance'},
-    {l:'Add Child...',c:'verde.addInstance'},
-    null,
-    {l:'Copy',c:'verde.copyInstance'},
-    {l:'Paste',c:'verde.pasteInstance'},
-    null,
-    {l:'Copy Roblox Path',c:'verde.copyRobloxPath'}
-  ];
-  if(isScript){items.push({l:'Copy File Path',c:'verde.copyFilePath'});items.push(null);items.push({l:'Open Script',c:'verde.openScript'})}
-  var html='';
+  var html='';var lastGroup=null;
   for(var i=0;i<items.length;i++){
     var it=items[i];
-    if(!it){html+='<div class="ctx-sep"></div>';continue}
-    html+='<div class="ctx-item" data-cmd="'+it.c+'">'+esc(it.l)+'</div>';
+    if(lastGroup!==null&&it.group!==lastGroup)html+='<div class="ctx-sep"></div>';
+    html+='<div class="ctx-item" data-cmd="'+esc(it.command)+'">'+esc(it.label)+'</div>';
+    lastGroup=it.group;
   }
   ctxEl.innerHTML=html;
   ctxEl.style.left=x+'px';ctxEl.style.top=y+'px';
@@ -727,7 +740,7 @@ function showCtx(x,y,id,isScript){
     if(r.bottom>window.innerHeight)ctxEl.style.top=Math.max(0,window.innerHeight-r.height-2)+'px';
   });
 }
-function hideCtx(){ctxEl.classList.add('hidden');ctxNodeId=null}
+function hideCtx(){ctxEl.classList.add('hidden');ctxNodeId=null;ctxPending=null}
 
 ctxEl.addEventListener('click',function(e){
   var item=e.target.closest('.ctx-item');if(!item||!ctxNodeId)return;

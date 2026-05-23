@@ -20,6 +20,7 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "types": "./out/api.d.ts",
   "contributes": {
     "configuration": {
       "title": "Verde",
@@ -58,6 +59,11 @@
           "type": "string",
           "default": "#264f78",
           "description": "Background color for selected items when Colored Selection is enabled"
+        },
+        "verde.allowExtensionScripting": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow third-party extensions to execute Luau code inside Roblox Studio via Verde's API. Also requires the workspace to be trusted; untrusted workspaces always refuse. Each extension is prompted for consent on first use. Disable to block all extension-initiated scripting."
         }
       }
     },
@@ -160,6 +166,11 @@
       {
         "command": "verde.togglePropertiesPanelMode",
         "title": "Toggle Properties Panel Mode",
+        "category": "Verde"
+      },
+      {
+        "command": "verde.revokeLuauConsent",
+        "title": "Revoke Luau Execution Consent",
         "category": "Verde"
       },
       {

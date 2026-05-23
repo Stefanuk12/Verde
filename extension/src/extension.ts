@@ -7,6 +7,9 @@ import { getClassNames, initClassNames } from "./robloxClasses";
 import { SourcemapParser } from "./sourcemapParser";
 import { isScriptClass } from "./utils";
 import { InstanceHistory, HistoryEntry } from "./instanceHistory";
+import { ContextMenuRegistry } from "./contextMenuRegistry";
+import { LuauExecutionService } from "./luauExecutionService";
+import { VerdeApi } from "./api";
 
 import * as fzy from "fzy.js";
 
@@ -18,7 +21,7 @@ let instanceHistory: InstanceHistory;
 let cachedQuickPickItems: (vscode.QuickPickItem & { node: Node })[] = [];
 let cachedSearchStrings: string[] = [];
 
-export async function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext): Promise<VerdeApi> {
 	const outputChannel = vscode.window.createOutputChannel("Verde Backend");
 	const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 
@@ -102,7 +105,9 @@ export async function activate(context: vscode.ExtensionContext) {
 		})
 	);
 
-	explorerViewProvider = new ExplorerViewProvider(context.extensionUri, explorerProvider, backend);
+	const contextMenuRegistry = new ContextMenuRegistry(outputChannel);
+	const luauExecutionService = new LuauExecutionService(backend, context.globalState);
+	explorerViewProvider = new ExplorerViewProvider(context.extensionUri, explorerProvider, backend, contextMenuRegistry);
 	backend.setPropertyUpdateCallback(syncScriptDisabledState);
 
 	context.subscriptions.push(
@@ -793,6 +798,59 @@ export async function activate(context: vscode.ExtensionContext) {
 		return false;
 	}
 
+	context.subscriptions.push(
+		vscode.commands.registerCommand("verde.revokeLuauConsent", async () => {
+			type RevokePick = vscode.QuickPickItem & { revokeAll?: true; extensionId?: string };
+
+			const ids = luauExecutionService.listConsentedExtensions();
+			if (ids.length === 0) {
+				vscode.window.showInformationMessage("Verde: no extensions currently have Luau execution consent.");
+				return;
+			}
+
+			const noun = ids.length === 1 ? "extension" : "extensions";
+			const picks: RevokePick[] = [
+				{ label: "$(trash) Revoke all", description: `${ids.length} ${noun}`, revokeAll: true },
+				{ label: "Individual extensions", kind: vscode.QuickPickItemKind.Separator },
+				...ids.map((id): RevokePick => {
+					const ext = vscode.extensions.getExtension(id);
+					const displayName =
+						(ext?.packageJSON as { displayName?: string } | undefined)?.displayName ||
+						(ext?.packageJSON as { name?: string } | undefined)?.name ||
+						id;
+					return { label: displayName, description: id, extensionId: id };
+				}),
+			];
+
+			const choice = await vscode.window.showQuickPick<RevokePick>(picks, {
+				placeHolder: "Revoke 'Always Allow' for which extension?",
+				canPickMany: false,
+			});
+			if (!choice) {
+				return;
+			}
+
+			if (choice.revokeAll) {
+				const confirm = await vscode.window.showWarningMessage(
+					`Revoke Luau execution consent for all ${ids.length} ${noun}?`,
+					{ modal: true },
+					"Revoke all",
+				);
+				if (confirm !== "Revoke all") {
+					return;
+				}
+				await luauExecutionService.revokeAllConsents();
+				vscode.window.showInformationMessage(`Verde: revoked Luau consent for ${ids.length} ${noun}.`);
+				return;
+			}
+
+			if (choice.extensionId) {
+				await luauExecutionService.revokeConsent(choice.extensionId);
+				vscode.window.showInformationMessage(`Verde: revoked Luau consent for "${choice.label}".`);
+			}
+		})
+	);
+
 	const config = vscode.workspace.getConfiguration("verde");
 	const autoStart = config.get<boolean>("autoStart", true);
 
@@ -804,6 +862,11 @@ export async function activate(context: vscode.ExtensionContext) {
 			outputChannel.show(true);
 		}
 	}
+
+	return {
+		registerContextMenuItem: (item) => contextMenuRegistry.register(item),
+		executeLuau: (opts) => luauExecutionService.execute(opts),
+	};
 }
 
 export async function deactivate() {

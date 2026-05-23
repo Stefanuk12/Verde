@@ -23,11 +23,12 @@ export type Operation =
     | { type: "stop_sound"; nodeId: string }
     | { type: "set_sound_time_position"; nodeId: string; timePosition: number }
     | { type: "get_sound_playback_info" }
+    | { type: "execute_luau"; code: string; description?: string; nodeId?: string; extensionId?: string }
     | { type: "undo" }
     | { type: "redo" }
 
 export type OperationResult =
-    | { success: true; data?: string | PropertiesData | boolean }
+    | { success: true; data?: unknown }
     | { success: false; error: string };
 
 export type PropertyInfo = {
@@ -160,6 +161,9 @@ export class VerdeBackend {
             socket.on("close", () => {
                 this.clients.delete(socket);
                 this.log(`client disconnected (${this.clients.size} total)`);
+                if (this.clients.size === 0) {
+                    this.failPendingOperations("client disconnected");
+                }
                 this.updateStatusBar();
             });
             socket.on("error", (err) => {
@@ -207,7 +211,7 @@ export class VerdeBackend {
             this.ackInterval = null;
         }
 
-        this.operationCallbacks.clear();
+        this.failPendingOperations("backend stopped");
         this.updateStatusBar();
     }
 
@@ -217,11 +221,21 @@ export class VerdeBackend {
         }
     }
 
-    public async sendOperation(operation: Operation): Promise<OperationResult> {
+    public hasConnectedClient(): boolean {
+        return this.clients.size > 0;
+    }
+
+    public connectedClientCount(): number {
+        return this.clients.size;
+    }
+
+    public async sendOperation<TData = unknown>(
+        operation: Operation,
+    ): Promise<{ success: true; data?: TData } | { success: false; error: string }> {
         return new Promise((resolve) => {
             const operationId = crypto.randomUUID();
 
-            this.operationCallbacks.set(operationId, resolve);
+            this.operationCallbacks.set(operationId, resolve as (result: OperationResult) => void);
 
             for (const socket of this.clients) {
                 this.send(socket, {
@@ -450,6 +464,21 @@ export class VerdeBackend {
         }
     }
 
+    private failPendingOperations(reason: string): void {
+        if (this.operationCallbacks.size === 0) {
+            return;
+        }
+        const callbacks = Array.from(this.operationCallbacks.values());
+        this.operationCallbacks.clear();
+        for (const callback of callbacks) {
+            try {
+                callback({ success: false, error: reason });
+            } catch (err) {
+                this.log(`operation callback threw during cleanup: ${String(err)}`);
+            }
+        }
+    }
+
     private send(socket: WebSocket, message: BackendOutboundMessage): void {
         if (socket.readyState !== WebSocket.OPEN) {
             return;
@@ -490,8 +519,11 @@ export class VerdeBackend {
                     this.clients.delete(socket);
                 }
 
-                if (this.clients.size === 0 && this.onConnectionLost) {
-                    this.onConnectionLost();
+                if (this.clients.size === 0) {
+                    this.failPendingOperations("client disconnected");
+                    if (this.onConnectionLost) {
+                        this.onConnectionLost();
+                    }
                 }
 
                 this.updateStatusBar();
