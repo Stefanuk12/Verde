@@ -40,7 +40,7 @@ jobs:
 
       - name: Install dependencies
         if: steps.version.outputs.changed == 'true'
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Package extension
         if: steps.version.outputs.changed == 'true'
