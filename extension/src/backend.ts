@@ -161,6 +161,9 @@ export class VerdeBackend {
             socket.on("close", () => {
                 this.clients.delete(socket);
                 this.log(`client disconnected (${this.clients.size} total)`);
+                if (this.clients.size === 0) {
+                    this.failPendingOperations("client disconnected");
+                }
                 this.updateStatusBar();
             });
             socket.on("error", (err) => {
@@ -208,7 +211,7 @@ export class VerdeBackend {
             this.ackInterval = null;
         }
 
-        this.operationCallbacks.clear();
+        this.failPendingOperations("backend stopped");
         this.updateStatusBar();
     }
 
@@ -220,6 +223,10 @@ export class VerdeBackend {
 
     public hasConnectedClient(): boolean {
         return this.clients.size > 0;
+    }
+
+    public connectedClientCount(): number {
+        return this.clients.size;
     }
 
     public async sendOperation<TData = unknown>(
@@ -457,6 +464,21 @@ export class VerdeBackend {
         }
     }
 
+    private failPendingOperations(reason: string): void {
+        if (this.operationCallbacks.size === 0) {
+            return;
+        }
+        const callbacks = Array.from(this.operationCallbacks.values());
+        this.operationCallbacks.clear();
+        for (const callback of callbacks) {
+            try {
+                callback({ success: false, error: reason });
+            } catch (err) {
+                this.log(`operation callback threw during cleanup: ${String(err)}`);
+            }
+        }
+    }
+
     private send(socket: WebSocket, message: BackendOutboundMessage): void {
         if (socket.readyState !== WebSocket.OPEN) {
             return;
@@ -497,8 +519,11 @@ export class VerdeBackend {
                     this.clients.delete(socket);
                 }
 
-                if (this.clients.size === 0 && this.onConnectionLost) {
-                    this.onConnectionLost();
+                if (this.clients.size === 0) {
+                    this.failPendingOperations("client disconnected");
+                    if (this.onConnectionLost) {
+                        this.onConnectionLost();
+                    }
                 }
 
                 this.updateStatusBar();

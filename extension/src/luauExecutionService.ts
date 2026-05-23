@@ -1,22 +1,17 @@
 import * as vscode from "vscode";
 import { VerdeBackend } from "./backend";
+import { ExecuteLuauOptions, ExecuteLuauResult } from "./api";
 
-export interface ExecuteLuauOptions {
-	extension: vscode.Extension<unknown>;
-	code: string;
-	description?: string;
-	nodeId?: string;
-}
+export { ExecuteLuauOptions, ExecuteLuauResult };
 
-export type ExecuteLuauResult =
-	| { success: true; data?: unknown }
-	| { success: false; error: string };
-
-type Consent = "always" | "session" | "denied";
+type PersistedConsent = "always";
+type Consent = PersistedConsent | "session" | "denied";
 
 const CONSENT_KEY_PREFIX = "verde.luauConsent.";
 const MAX_DESCRIPTION_LEN = 280;
 const MAX_DISPLAY_NAME_LEN = 80;
+const MAX_CODE_LEN = 1024 * 1024;
+const MAX_NODE_ID_LEN = 256;
 
 // Remove characters which can spoof the consent modal.
 const UNSAFE_CHARS = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
@@ -35,8 +30,22 @@ export class LuauExecutionService {
 		if (!options.extension || typeof options.extension.id !== "string") {
 			return { success: false, error: "executeLuau requires a vscode.Extension reference (pass context.extension)" };
 		}
-		if (!options.code) {
+		if (typeof options.code !== "string" || options.code.length === 0) {
 			return { success: false, error: "executeLuau requires code" };
+		}
+		if (options.code.length > MAX_CODE_LEN) {
+			return {
+				success: false,
+				error: `executeLuau: code exceeds maximum length (${MAX_CODE_LEN} bytes).`,
+			};
+		}
+		if (options.nodeId !== undefined) {
+			if (typeof options.nodeId !== "string" || options.nodeId.length === 0) {
+				return { success: false, error: "executeLuau: nodeId must be a non-empty string when provided." };
+			}
+			if (options.nodeId.length > MAX_NODE_ID_LEN) {
+				return { success: false, error: "executeLuau: nodeId is too long." };
+			}
 		}
 
 		const enabled = vscode.workspace
@@ -73,12 +82,29 @@ export class LuauExecutionService {
 			};
 		}
 
+		if (this.backend.connectedClientCount() > 1) {
+			return {
+				success: false,
+				error: "executeLuau: multiple Roblox Studio sessions are connected to Verde. Disconnect all but one and retry.",
+			};
+		}
+
 		const displayName = readDisplayName(options.extension);
 		const safeDescription = sanitizeText(options.description, MAX_DESCRIPTION_LEN);
 
 		const consent = await this.ensureConsent(extensionId, displayName, safeDescription);
 		if (consent === "denied") {
 			return { success: false, error: "User denied Luau execution for this extension." };
+		}
+
+		if (!this.backend.hasConnectedClient()) {
+			return { success: false, error: "Roblox Studio disconnected before execution could begin." };
+		}
+		if (this.backend.connectedClientCount() > 1) {
+			return {
+				success: false,
+				error: "executeLuau: a second Roblox Studio session connected during the consent prompt. Disconnect all but one and retry.",
+			};
 		}
 
 		const result = await this.backend.sendOperation<{ value?: unknown }>({
@@ -121,7 +147,7 @@ export class LuauExecutionService {
 		displayName: string,
 		safeDescription: string | undefined,
 	): Promise<Consent> {
-		const stored = this.globalState.get<Consent>(CONSENT_KEY_PREFIX + extensionId);
+		const stored = this.globalState.get<PersistedConsent>(CONSENT_KEY_PREFIX + extensionId);
 		if (stored === "always") {
 			return Promise.resolve("always");
 		}
@@ -152,7 +178,7 @@ export class LuauExecutionService {
 				);
 
 				if (choice === "Always Allow") {
-					const current = this.globalState.get<Consent>(CONSENT_KEY_PREFIX + extensionId);
+					const current = this.globalState.get<PersistedConsent>(CONSENT_KEY_PREFIX + extensionId);
 					if (current !== "always") {
 						await this.globalState.update(CONSENT_KEY_PREFIX + extensionId, "always");
 					}

@@ -20,6 +20,7 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "types": "./index.d.ts",
   "contributes": {
     "configuration": {
       "title": "Verde",

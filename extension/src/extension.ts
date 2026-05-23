@@ -7,8 +7,9 @@ import { getClassNames, initClassNames } from "./robloxClasses";
 import { SourcemapParser } from "./sourcemapParser";
 import { isScriptClass } from "./utils";
 import { InstanceHistory, HistoryEntry } from "./instanceHistory";
-import { ContextMenuRegistry, VerdeApi } from "./contextMenuRegistry";
+import { ContextMenuRegistry } from "./contextMenuRegistry";
 import { LuauExecutionService } from "./luauExecutionService";
+import { VerdeApi } from "./api";
 
 import * as fzy from "fzy.js";
 

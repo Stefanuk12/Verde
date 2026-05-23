@@ -1,16 +1,7 @@
 import * as vscode from "vscode";
 import { Node } from "./robloxExplorerProvider";
 import { isScriptClass } from "./utils";
-import { ExecuteLuauOptions, ExecuteLuauResult } from "./luauExecutionService";
-
-export interface VerdeContextMenuItem {
-  id: string;
-  label: string;
-  command: string;
-  group?: string;
-  order?: number;
-  when?: (node: Node) => boolean;
-}
+import { VerdeContextMenuItem } from "./api";
 
 export interface SerializedContextMenuItem {
   id: string;
@@ -96,8 +87,10 @@ const BUILT_IN_IDS: ReadonlySet<string> = new Set(
 );
 
 const RESERVED_GROUPS: ReadonlySet<string> = new Set(
-  BUILT_IN_ITEMS.map((it) => it.group!).filter((g): g is string => !!g),
+  BUILT_IN_ITEMS.map((it) => it.group).filter((g): g is string => !!g),
 );
+
+const EXTENSION_GROUP_PATTERN = /^([5-9]|[1-9][0-9]+)_/;
 
 export class ContextMenuRegistry {
   private items: Map<string, VerdeContextMenuItem> = new Map();
@@ -115,10 +108,22 @@ export class ContextMenuRegistry {
         `Verde context menu item id "${item.id}" collides with a built-in item.`,
       );
     }
-    if (item.group !== undefined && RESERVED_GROUPS.has(item.group)) {
+    if (item.command.startsWith("verde.")) {
       throw new Error(
-        `Verde context menu item "${item.id}" uses reserved group "${item.group}". Use a group starting with "5_" or later.`,
+        `Verde context menu item "${item.id}" cannot invoke built-in command "${item.command}". Register your own command instead.`,
       );
+    }
+    if (item.group !== undefined) {
+      if (RESERVED_GROUPS.has(item.group)) {
+        throw new Error(
+          `Verde context menu item "${item.id}" uses reserved group "${item.group}". Use a group starting with "5_" or later.`,
+        );
+      }
+      if (!EXTENSION_GROUP_PATTERN.test(item.group)) {
+        throw new Error(
+          `Verde context menu item "${item.id}" uses group "${item.group}". Extension groups must start with 5_–99_ (e.g. "5_mygame").`,
+        );
+      }
     }
     if (this.items.has(item.id)) {
       throw new Error(
@@ -163,9 +168,4 @@ export class ContextMenuRegistry {
       return false;
     }
   }
-}
-
-export interface VerdeApi {
-  registerContextMenuItem(item: VerdeContextMenuItem): vscode.Disposable;
-  executeLuau(options: ExecuteLuauOptions): Promise<ExecuteLuauResult>;
 }
