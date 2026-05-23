@@ -1,13 +1,23 @@
 import * as vscode from "vscode";
-import { Node } from "./robloxExplorerProvider";
+
+export interface VerdeNode {
+	id: string;
+	name: string;
+	className: string;
+	parentId: string | null;
+	children: string[];
+	disabled?: boolean;
+	runContext?: string;
+}
 
 export interface VerdeContextMenuItem {
 	id: string;
 	label: string;
 	command: string;
+	/** Sort bucket; must match /^([5-9]|[1-9][0-9]+)_/ (e.g. "5_mygame"). */
 	group?: string;
 	order?: number;
-	when?: (node: Node) => boolean;
+	when?: (node: VerdeNode) => boolean;
 }
 
 export interface ExecuteLuauOptions {

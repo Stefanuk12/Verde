@@ -1,3 +1,5 @@
+-- SECURITY NOTE: this is NOT a sandbox. There are some safeguards but users must trust the code themselves.
+
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 

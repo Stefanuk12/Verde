@@ -166,12 +166,12 @@ export class LuauExecutionService {
 		const promise = (async (): Promise<Consent> => {
 			try {
 				const safeId = sanitizeText(extensionId, MAX_DISPLAY_NAME_LEN) ?? extensionId;
+				const displayLine = displayName === safeId ? "" : ` (${displayName})`;
 				const detail = safeDescription ? `\n\nAction: ${safeDescription}` : "";
 				const choice = await vscode.window.showWarningMessage(
-					`Extension "${safeId}" wants to run Luau inside Roblox Studio via Verde.\n\n` +
-						`Marketplace display name: ${displayName}\n\n` +
-						`This grants the extension full Studio plugin access - file system, HTTP, ` +
-						`and the ability to modify your place. Only allow extensions you trust.${detail}`,
+					`Allow "${safeId}"${displayLine} to run arbitrary Luau in Roblox Studio?\n\n` +
+						`This grants full Studio plugin access. Consent is per-extension, not per-call; ` +
+						`revoke via "Verde: Revoke Luau Execution Consent".${detail}`,
 					{ modal: true },
 					"Allow for Session",
 					"Always Allow",
