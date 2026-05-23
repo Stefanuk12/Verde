@@ -23,6 +23,7 @@ const UNSAFE_CHARS = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066
 
 export class LuauExecutionService {
 	private sessionConsent: Set<string> = new Set();
+	private sessionDenied: Set<string> = new Set();
 	private pendingPrompts: Map<string, Promise<Consent>> = new Map();
 
 	constructor(
@@ -38,26 +39,6 @@ export class LuauExecutionService {
 			return { success: false, error: "executeLuau requires code" };
 		}
 
-		const extensionId = options.extension.id;
-
-		const registered = vscode.extensions.getExtension(extensionId);
-		if (!registered || registered !== options.extension) {
-			return {
-				success: false,
-				error: "executeLuau: extension reference does not match the registered extension for this id (pass your own context.extension)",
-			};
-		}
-
-		if (!vscode.workspace.isTrusted) {
-			return {
-				success: false,
-				error: "Luau execution is disabled in untrusted workspaces. Mark this workspace as trusted to continue.",
-			};
-		}
-
-		const displayName = readDisplayName(options.extension);
-		const safeDescription = sanitizeText(options.description, MAX_DESCRIPTION_LEN);
-
 		const enabled = vscode.workspace
 			.getConfiguration("verde")
 			.get<boolean>("allowExtensionScripting", false);
@@ -68,6 +49,23 @@ export class LuauExecutionService {
 			};
 		}
 
+		if (!vscode.workspace.isTrusted) {
+			return {
+				success: false,
+				error: "Luau execution is disabled in untrusted workspaces. Mark this workspace as trusted to continue.",
+			};
+		}
+
+		const extensionId = options.extension.id;
+
+		const registered = vscode.extensions.getExtension(extensionId);
+		if (!registered || registered !== options.extension) {
+			return {
+				success: false,
+				error: "executeLuau: extension reference does not match the registered extension for this id (pass your own context.extension)",
+			};
+		}
+
 		if (!this.backend.hasConnectedClient()) {
 			return {
 				success: false,
@@ -75,12 +73,15 @@ export class LuauExecutionService {
 			};
 		}
 
+		const displayName = readDisplayName(options.extension);
+		const safeDescription = sanitizeText(options.description, MAX_DESCRIPTION_LEN);
+
 		const consent = await this.ensureConsent(extensionId, displayName, safeDescription);
 		if (consent === "denied") {
 			return { success: false, error: "User denied Luau execution for this extension." };
 		}
 
-		const result = await this.backend.sendOperation({
+		const result = await this.backend.sendOperation<{ value?: unknown }>({
 			type: "execute_luau",
 			code: options.code,
 			description: safeDescription,
@@ -89,8 +90,7 @@ export class LuauExecutionService {
 		});
 
 		if (result.success) {
-			const wrapper = result.data as { value?: unknown } | undefined;
-			return { success: true, data: wrapper?.value };
+			return { success: true, data: result.data?.value };
 		}
 		return { success: false, error: result.error };
 	}
@@ -106,12 +106,14 @@ export class LuauExecutionService {
 	public async revokeConsent(extensionId: string): Promise<void> {
 		await this.globalState.update(CONSENT_KEY_PREFIX + extensionId, undefined);
 		this.sessionConsent.delete(extensionId);
+		this.sessionDenied.delete(extensionId);
 	}
 
 	public async revokeAllConsents(): Promise<void> {
 		const ids = this.listConsentedExtensions();
 		await Promise.all(ids.map((id) => this.globalState.update(CONSENT_KEY_PREFIX + id, undefined)));
 		this.sessionConsent.clear();
+		this.sessionDenied.clear();
 	}
 
 	private ensureConsent(
@@ -126,6 +128,9 @@ export class LuauExecutionService {
 		if (this.sessionConsent.has(extensionId)) {
 			return Promise.resolve("session");
 		}
+		if (this.sessionDenied.has(extensionId)) {
+			return Promise.resolve("denied");
+		}
 
 		const inFlight = this.pendingPrompts.get(extensionId);
 		if (inFlight) {
@@ -134,9 +139,10 @@ export class LuauExecutionService {
 
 		const promise = (async (): Promise<Consent> => {
 			try {
+				const safeId = sanitizeText(extensionId, MAX_DISPLAY_NAME_LEN) ?? extensionId;
 				const detail = safeDescription ? `\n\nAction: ${safeDescription}` : "";
 				const choice = await vscode.window.showWarningMessage(
-					`Extension "${extensionId}" wants to run Luau inside Roblox Studio via Verde.\n\n` +
+					`Extension "${safeId}" wants to run Luau inside Roblox Studio via Verde.\n\n` +
 						`Marketplace display name: ${displayName}\n\n` +
 						`This grants the extension full Studio plugin access - file system, HTTP, ` +
 						`and the ability to modify your place. Only allow extensions you trust.${detail}`,
@@ -156,6 +162,7 @@ export class LuauExecutionService {
 					this.sessionConsent.add(extensionId);
 					return "session";
 				}
+				this.sessionDenied.add(extensionId);
 				return "denied";
 			} finally {
 				this.pendingPrompts.delete(extensionId);

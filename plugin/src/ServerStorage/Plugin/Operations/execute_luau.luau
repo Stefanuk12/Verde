@@ -10,7 +10,7 @@ type Payload = {
 	extensionId: string?,
 }
 
-local function _sanitizeId(raw: string?): string
+local function sanitizeId(raw: string?): string
 	if not raw or raw == "" then
 		return "extension"
 	end
@@ -30,7 +30,7 @@ return function(payload: Payload): (any, string?)
 		return false, "execute_luau: missing code"
 	end
 
-	local extensionId = _sanitizeId(payload.extensionId)
+	local extensionId = sanitizeId(payload.extensionId)
 	local description = payload.description or `Verde: {extensionId}`
 
 	local selection: Instance? = nil
@@ -63,7 +63,9 @@ return function(payload: Payload): (any, string?)
 
 	local recording = ChangeHistoryService:TryBeginRecording(`ExecuteLuau: {extensionId}`, description)
 	if not recording then
-		return false, "execute_luau: could not begin recording (concurrent call?)"
+		return false,
+			"execute_luau: ChangeHistoryService is busy. Another Verde operation or "
+				.. "Studio recording is in progress; retry after it completes."
 	end
 
 	local userResult: any

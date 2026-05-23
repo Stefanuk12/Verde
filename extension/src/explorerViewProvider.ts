@@ -192,7 +192,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       }
       case "requestContextMenu": {
         const node = msg.nodeId ? this.explorerProvider.getNodeById(msg.nodeId) : undefined;
-        if (!node) break;
+        if (!node) {
+          this.post({ type: "showContextMenu", requestId: msg.requestId, nodeId: msg.nodeId, items: [] });
+          break;
+        }
         const items = this.contextMenuRegistry.itemsFor(node);
         this.post({ type: "showContextMenu", requestId: msg.requestId, nodeId: node.id, items });
         break;

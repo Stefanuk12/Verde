@@ -222,11 +222,13 @@ export class VerdeBackend {
         return this.clients.size > 0;
     }
 
-    public async sendOperation(operation: Operation): Promise<OperationResult> {
+    public async sendOperation<TData = unknown>(
+        operation: Operation,
+    ): Promise<{ success: true; data?: TData } | { success: false; error: string }> {
         return new Promise((resolve) => {
             const operationId = crypto.randomUUID();
 
-            this.operationCallbacks.set(operationId, resolve);
+            this.operationCallbacks.set(operationId, resolve as (result: OperationResult) => void);
 
             for (const socket of this.clients) {
                 this.send(socket, {
