@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'extension/package.json'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: version
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          PREVIOUS=$(git show HEAD~1:extension/package.json | node -p "JSON.parse(require('fs').readFileSync(0)).version" 2>/dev/null || echo "")
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          if [ "$CURRENT" != "$PREVIOUS" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Version changed: $PREVIOUS -> $CURRENT"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Version unchanged ($CURRENT), skipping release"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.changed == 'true'
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        if: steps.version.outputs.changed == 'true'
+        run: npm ci
+
+      - name: Package extension
+        if: steps.version.outputs.changed == 'true'
+        run: npx vsce package -o verde-${{ steps.version.outputs.current }}.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: steps.version.outputs.changed == 'true'
+        run: npx vsce publish -p ${{ secrets.VSCE_PAT }}
+
+      - name: Publish to Open VSX
+        if: steps.version.outputs.changed == 'true'
+        run: npx ovsx publish verde-${{ steps.version.outputs.current }}.vsix -p ${{ secrets.OVSX_PAT }}
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.current }}
+          name: v${{ steps.version.outputs.current }}
+          files: extension/verde-${{ steps.version.outputs.current }}.vsix
+          generate_release_notes: true
