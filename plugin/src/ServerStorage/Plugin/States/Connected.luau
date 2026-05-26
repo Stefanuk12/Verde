@@ -26,6 +26,7 @@ local deltaPromise: any = nil
 local pendingOps: { any } = {}
 
 local lastAckTime = 0
+local initialSyncComplete = false
 
 local function _fillInstanceMap(instance: Instance)
 	InstanceMap[instance:GetDebugId(0)] = instance
@@ -39,11 +40,34 @@ for _, operationMod in script.Parent.Parent.Operations:GetChildren() do
 	operations[operationMod.Name] = operation
 end
 
+local SNAPSHOT_CHUNK_SIZE = 2000
+local snapshotInFlight = false
+
+local function _sendJson(client: Client, message: any, label: string): boolean
+	local jsonSuccess, jsonString = pcall(function()
+		return HttpService:JSONEncode(message)
+	end)
+	if not jsonSuccess then
+		warn(string.format("[verde] %s: failed to encode JSON: %s", label, tostring(jsonString)))
+		return false
+	end
+	if not client:send(jsonString) then
+		warn(string.format("[verde] %s: failed to send (payload %d bytes)", label, #jsonString))
+		return false
+	end
+	return true
+end
+
 local function _sendSnapshot(client: Client)
 	if not client or not client.connected then
 		print("sendSnapshot: not connected")
 		return
 	end
+
+	if snapshotInFlight then
+		return
+	end
+	snapshotInFlight = true
 
 	local snapshot, _instanceMap = SerializeDatamodel.serializeFull()
 
@@ -51,21 +75,58 @@ local function _sendSnapshot(client: Client)
 		InstanceMap[id] = instance
 	end
 
-	local message = {
-		type = "explorer_snapshot",
-		payload = snapshot,
-	}
+	local nodes = snapshot.nodes
+	local total = #nodes
 
-	local jsonSuccess, jsonString = pcall(function()
-		return HttpService:JSONEncode(message)
-	end)
-
-	if not jsonSuccess then
-		error("sendSnapshot: failed to encode JSON:", jsonString)
+	if
+		not _sendJson(client, {
+			type = "explorer_snapshot_start",
+			rootIds = snapshot.rootIds,
+			totalNodes = total,
+		}, "snapshot_start")
+	then
+		snapshotInFlight = false
 		return
 	end
 
-	assert(client:send(jsonString), "failed to send snapshot")
+	for startIndex = 1, math.max(total, 1), SNAPSHOT_CHUNK_SIZE do
+		if not client.connected then
+			warn("[verde] snapshot stream aborted: client disconnected")
+			snapshotInFlight = false
+			return
+		end
+
+		local endIndex = math.min(startIndex + SNAPSHOT_CHUNK_SIZE - 1, total)
+		local chunk = table.create(endIndex - startIndex + 1)
+		for i = startIndex, endIndex do
+			chunk[#chunk + 1] = nodes[i]
+		end
+
+		if not _sendJson(client, {
+			type = "explorer_snapshot_chunk",
+			nodes = chunk,
+		}, "snapshot_chunk") then
+			snapshotInFlight = false
+			return
+		end
+
+		task.wait()
+
+		if total == 0 then
+			break
+		end
+	end
+
+	if not _sendJson(client, {
+		type = "explorer_snapshot_end",
+	}, "snapshot_end") then
+		snapshotInFlight = false
+		return
+	end
+
+	lastAckTime = tick()
+	initialSyncComplete = true
+	snapshotInFlight = false
 end
 
 local function _flushDelta(client: Client)
@@ -399,7 +460,7 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 	end
 
 	lastAckTime = tick()
-	_sendSnapshot(client)
+	initialSyncComplete = false
 end
 
 connected.onExit = function()
@@ -434,9 +495,15 @@ connected.onExit = function()
 	table.clear(pendingOps)
 	table.clear(InstanceMap)
 	lastAckTime = tick()
+	initialSyncComplete = false
+	snapshotInFlight = false
 end
 
 connected.onUpdate = function(dt, transitionTo: (string) -> ())
+	if not initialSyncComplete then
+		return
+	end
+
 	local now = tick()
 
 	if now - lastAckTime > 5 then

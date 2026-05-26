@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { RobloxExplorerProvider, Node } from "./robloxExplorerProvider";
+import { ExplorerDeltaOp } from "./backend";
 import { VerdeBackend } from "./backend";
 import { getClassNames } from "./robloxClasses";
 import { isScriptClass, scriptIconClass } from "./utils";
@@ -11,7 +12,7 @@ type WebviewNode = {
   name: string;
   className: string;
   iconClassName: string;
-  children: string[];
+  hasChildren: boolean;
   isScript: boolean;
   disabled?: boolean;
 };
@@ -22,15 +23,14 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   private webviewView: vscode.WebviewView | undefined;
   private selectedIds: string[] = [];
   private selectionListeners: ((nodes: Node[]) => void)[] = [];
+  private knownParentIds: Set<string> = new Set();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly explorerProvider: RobloxExplorerProvider,
     private readonly backend: VerdeBackend,
     private readonly contextMenuRegistry: ContextMenuRegistry,
-  ) {
-    this.explorerProvider.onChange(() => this.pushTree());
-  }
+  ) {}
 
   public onSelectionChanged(listener: (nodes: Node[]) => void): void {
     this.selectionListeners.push(listener);
@@ -55,21 +55,28 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public collapseAll(): void {
+    this.knownParentIds.clear();
     this.post({ type: "collapseAll" });
   }
 
   public reveal(node: Node): void {
-    const ancestors: string[] = [];
+    const chain: string[] = [];
     let cur: Node | undefined = node;
     while (cur?.parentId) {
-      ancestors.push(cur.parentId);
+      chain.unshift(cur.parentId);
       cur = this.explorerProvider.getNodeById(cur.parentId);
     }
     this.selectedIds = [node.id];
+    const preload: Record<string, WebviewNode[]> = {};
+    for (const parentId of chain) {
+      preload[parentId] = this.serializeChildren(parentId);
+      this.knownParentIds.add(parentId);
+    }
     this.post({
       type: "revealNode",
       nodeId: node.id,
-      ancestors,
+      chain,
+      preload,
       selectedIds: [node.id],
     });
     this.fireSelectionChanged();
@@ -99,7 +106,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       vscode.Uri.joinPath(this.extensionUri, "assets")
     ).toString();
     webviewView.webview.html = this.buildHtml(webviewView.webview, assetBase);
-    this.pushTree();
+    this.pushSnapshot();
     this.pushSelectionColor();
   }
 
@@ -109,7 +116,73 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       vscode.Uri.joinPath(this.extensionUri, "assets")
     ).toString();
     this.webviewView.webview.html = this.buildHtml(this.webviewView.webview, assetBase);
-    this.pushTree();
+    this.pushSnapshot();
+  }
+
+  public notifySnapshotReplaced(): void {
+    this.knownParentIds.clear();
+    this.pushSnapshot();
+  }
+
+  public notifyDelta(ops: ExplorerDeltaOp[]): void {
+    if (!this.webviewView) return;
+    const invalidate = new Set<string>();
+    const updates: { id: string; patch: Partial<WebviewNode> }[] = [];
+    for (const op of ops) {
+      switch (op.type) {
+        case "add_subtree": {
+          const pid = op.parentId;
+          if (pid === null) {
+            invalidate.add("");
+          } else if (this.knownParentIds.has(pid)) {
+            invalidate.add(pid);
+          }
+          break;
+        }
+        case "remove_node": {
+          const node = this.explorerProvider.getNodeById(op.id);
+          const pid = node?.parentId ?? null;
+          if (pid === null) invalidate.add("");
+          else if (this.knownParentIds.has(pid)) invalidate.add(pid);
+          break;
+        }
+        case "move_node": {
+          const existing = this.explorerProvider.getNodeById(op.id);
+          const oldPid = existing?.parentId ?? null;
+          const newPid = op.newParentId;
+          if (oldPid === null) invalidate.add("");
+          else if (this.knownParentIds.has(oldPid)) invalidate.add(oldPid);
+          if (newPid === null) invalidate.add("");
+          else if (this.knownParentIds.has(newPid)) invalidate.add(newPid);
+          break;
+        }
+        case "update_node": {
+          const node = this.explorerProvider.getNodeById(op.id);
+          if (!node) break;
+          const patch: Partial<WebviewNode> = {};
+          if (op.name !== undefined) patch.name = op.name;
+          if (op.runContext !== undefined) patch.iconClassName = scriptIconClass(node.className, op.runContext);
+          if (op.disabled !== undefined && isScriptClass(node.className)) patch.disabled = op.disabled;
+          if (Object.keys(patch).length > 0) updates.push({ id: op.id, patch });
+          const pid = node.parentId ?? null;
+          if (op.name !== undefined) {
+            if (pid === null) invalidate.add("");
+            else if (this.knownParentIds.has(pid)) invalidate.add(pid);
+          }
+          break;
+        }
+      }
+    }
+    for (const u of updates) {
+      this.post({ type: "updateNode", id: u.id, patch: u.patch });
+    }
+    if (invalidate.size > 0) {
+      this.post({ type: "invalidateChildren", parentIds: Array.from(invalidate) });
+    }
+  }
+
+  public notifyDisabledChanged(id: string, disabled: boolean): void {
+    this.post({ type: "updateNode", id, patch: { disabled } });
   }
 
   private post(msg: unknown): void {
@@ -125,31 +198,33 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private pushTree(): void {
+  private serializeChildren(parentId: string | null): WebviewNode[] {
+    const children = this.explorerProvider.getSortedChildren(parentId);
+    return children.map(n => this.serializeNode(n));
+  }
+
+  private serializeNode(n: Node): WebviewNode {
+    const isScript = isScriptClass(n.className);
+    const w: WebviewNode = {
+      id: n.id,
+      name: n.name,
+      className: n.className,
+      iconClassName: scriptIconClass(n.className, n.runContext),
+      hasChildren: n.children.length > 0,
+      isScript,
+    };
+    if (isScript) w.disabled = !!n.disabled;
+    return w;
+  }
+
+  private pushSnapshot(): void {
     if (!this.webviewView) return;
-    const all = this.explorerProvider.getAllNodes();
-    const nodes: Record<string, WebviewNode> = {};
-    for (const n of all) {
-      const sorted = this.explorerProvider.getSortedChildren(n.id);
-      const isScript = isScriptClass(n.className);
-      const w: WebviewNode = {
-        id: n.id,
-        name: n.name,
-        className: n.className,
-        iconClassName: scriptIconClass(n.className, n.runContext),
-        children: sorted.map(c => c.id),
-        isScript,
-      };
-      if (isScript) {
-        w.disabled = !!n.disabled;
-      }
-      nodes[n.id] = w;
-    }
-    const roots = this.explorerProvider.getSortedChildren(null);
+    const rootNodes = this.serializeChildren(null);
+    this.knownParentIds.clear();
+    this.knownParentIds.add("");
     this.post({
-      type: "updateTree",
-      nodes,
-      rootIds: roots.map(c => c.id),
+      type: "snapshotReplaced",
+      rootNodes,
       selectedIds: this.selectedIds,
     });
   }
@@ -165,6 +240,33 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         this.selectedIds = msg.nodeIds ?? [];
         this.fireSelectionChanged();
         break;
+      case "requestChildren": {
+        const parentId = typeof msg.nodeId === "string" ? msg.nodeId : "";
+        const key = parentId === "" ? null : parentId;
+        const nodes = this.serializeChildren(key);
+        this.knownParentIds.add(parentId);
+        this.post({ type: "children", parentId, nodes });
+        break;
+      }
+      case "requestAncestors": {
+        const targetId = msg.nodeId as string;
+        const target = this.explorerProvider.getNodeById(targetId);
+        const chain: string[] = [];
+        const preload: Record<string, WebviewNode[]> = {};
+        if (target) {
+          let cur: Node | undefined = target;
+          while (cur?.parentId) {
+            chain.unshift(cur.parentId);
+            cur = this.explorerProvider.getNodeById(cur.parentId);
+          }
+          for (const pid of chain) {
+            preload[pid] = this.serializeChildren(pid);
+            this.knownParentIds.add(pid);
+          }
+        }
+        this.post({ type: "ancestors", nodeId: targetId, chain, preload });
+        break;
+      }
       case "createInstance":
         this.doCreateInstance(msg.parentId, msg.className);
         break;
@@ -277,8 +379,10 @@ body{display:flex;flex-direction:column}
 #search{width:100%;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,transparent);border-radius:2px;padding:3px 4px;outline:none;font:inherit}
 #search:focus{border-color:var(--vscode-focusBorder)}
 
-#tree{flex:1;overflow-y:auto;overflow-x:hidden;outline:none;padding:0;background:var(--vscode-sideBar-background)}
-.tree-row{display:flex;align-items:center;height:22px;cursor:pointer;padding-right:0;white-space:nowrap;user-select:none}
+#tree{flex:1;overflow-y:auto;overflow-x:hidden;outline:none;padding:0;background:var(--vscode-sideBar-background);position:relative}
+#tree-spacer{width:1px;pointer-events:none}
+#tree-rows{position:absolute;top:0;left:0;right:0}
+.tree-row{display:flex;align-items:center;height:22px;cursor:pointer;padding-right:0;white-space:nowrap;user-select:none;position:absolute;left:0;right:0}
 .tree-row:hover{background:var(--vscode-list-hoverBackground)}
 .tree-row.selected{background:var(--vscode-list-inactiveSelectionBackground);color:var(--vscode-list-inactiveSelectionForeground)}
 #tree:focus-within .tree-row.selected{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
@@ -328,7 +432,7 @@ ${themeScript}
 </head>
 <body>
 <div id="search-bar"><input id="search" type="text" placeholder="Search explorer..." spellcheck="false" /></div>
-<div id="tree" tabindex="0"></div>
+<div id="tree" tabindex="0"><div id="tree-spacer"></div><div id="tree-rows"></div></div>
 <div id="quick-add" class="hidden">
   <div id="qa-panel">
     <input id="qa-search" type="text" placeholder="Search object" spellcheck="false" autocomplete="off" />
@@ -344,8 +448,12 @@ var ASSET=${JSON.stringify(assetBase)};
 var CLASSES=${JSON.stringify(getClassNames())};
 var vscode=acquireVsCodeApi();
 
-var nodes={},rootIds=[],selectedIds=[];
-var searchFilter='';
+var nodes={};
+var childrenByParent={};
+var rootIds=[];
+var selectedIds=[];
+var pendingChildren={};
+var pendingAncestors={};
 var qaParentId=null,qaFiltered=CLASSES,qaIdx=0,qaOutsideClick=null;
 var ctxNodeId=null;
 var renameNodeId=null;
@@ -355,16 +463,24 @@ var slowClickTimer=null;
 var lastClickTime=0,lastClickId=null;
 
 var expandedIds=new Set();
-var searchExpandedIds=new Set();
-var savedExpandedIds=null;
 var dragSourceId=null;
-var saved=vscode.getState();
-if(saved&&Array.isArray(saved.exp))expandedIds=new Set(saved.exp);
-function activeExp(){return searchFilter?searchExpandedIds:expandedIds}
-function saveExp(){if(!searchFilter)vscode.setState({exp:[...expandedIds]})}
+
+function ingestNodes(arr){
+  if(!arr)return;
+  for(var i=0;i<arr.length;i++){var n=arr[i];nodes[n.id]=n}
+}
+function storeChildren(parentId,arr){
+  ingestNodes(arr);
+  var ids=[];
+  for(var i=0;i<arr.length;i++)ids.push(arr[i].id);
+  childrenByParent[parentId]=ids;
+}
+
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
 var treeEl=document.getElementById('tree');
+var spacerEl=document.getElementById('tree-spacer');
+var rowsEl=document.getElementById('tree-rows');
 var searchEl=document.getElementById('search');
 var ctxEl=document.getElementById('ctx-menu');
 var qaEl=document.getElementById('quick-add');
@@ -374,29 +490,69 @@ var qaListEl=document.getElementById('qa-list');
 
 document.addEventListener('error',function(e){if(e.target&&e.target.tagName==='IMG')e.target.style.visibility='hidden'},true);
 
-/* ---- messages from extension ---- */
+function requestChildren(parentId){
+  if(pendingChildren[parentId])return;
+  pendingChildren[parentId]=true;
+  vscode.postMessage({type:'requestChildren',nodeId:parentId});
+}
+
 window.addEventListener('message',function(e){
   var m=e.data;
   switch(m.type){
-    case 'updateTree':
-      nodes=m.nodes||{};rootIds=m.rootIds||[];
-      selectedIds=m.selectedIds||selectedIds;
-      for(var k in nodes){var nn=nodes[k];nn._nl=nn.name.toLowerCase();nn._cl=nn.className.toLowerCase()}
+    case 'snapshotReplaced':
+      nodes={};childrenByParent={};pendingChildren={};pendingAncestors={};
+      ingestNodes(m.rootNodes||[]);
+      rootIds=[];for(var i=0;i<(m.rootNodes||[]).length;i++)rootIds.push(m.rootNodes[i].id);
+      childrenByParent['']=rootIds.slice();
+      selectedIds=m.selectedIds||[];
       renderTree();break;
+    case 'children':
+      delete pendingChildren[m.parentId];
+      storeChildren(m.parentId,m.nodes||[]);
+      renderTree();break;
+    case 'ancestors':
+      var pre=m.preload||{};
+      for(var pid in pre){storeChildren(pid,pre[pid])}
+      var pa=pendingAncestors[m.nodeId];
+      delete pendingAncestors[m.nodeId];
+      if(pa){pa(m.chain||[])}
+      break;
+    case 'invalidateChildren':
+      var ids=m.parentIds||[];
+      for(var i=0;i<ids.length;i++){
+        var pid=ids[i];
+        if(expandedIds.has(pid)||pid===''){requestChildren(pid)}
+        else{delete childrenByParent[pid]}
+      }
+      break;
+    case 'updateNode':
+      var n=nodes[m.id];
+      if(n){
+        var p=m.patch||{};
+        for(var k in p)n[k]=p[k];
+        renderTree();
+      }
+      break;
     case 'updateSelection':
       selectedIds=m.selectedIds||[];updateSelVis();break;
     case 'revealNode':
-      if(Array.isArray(m.ancestors))m.ancestors.forEach(function(id){expandedIds.add(id)});
+      var chain=m.chain||[];
+      var pre=m.preload||{};
+      for(var pid in pre){storeChildren(pid,pre[pid])}
+      for(var i=0;i<chain.length;i++)expandedIds.add(chain[i]);
       selectedIds=m.selectedIds||[];
-      saveExp();renderTree();
+      renderTree();
       requestAnimationFrame(function(){scrollTo(m.nodeId);treeEl.focus()});break;
     case 'focusTree':
       treeEl.focus();break;
     case 'scrollToNode':
       requestAnimationFrame(function(){scrollTo(m.nodeId)});break;
     case 'expandNodes':
-      if(Array.isArray(m.nodeIds))m.nodeIds.forEach(function(id){expandedIds.add(id)});
-      saveExp();renderTree();break;
+      if(Array.isArray(m.nodeIds))m.nodeIds.forEach(function(id){
+        expandedIds.add(id);
+        if(!childrenByParent[id])requestChildren(id);
+      });
+      renderTree();break;
     case 'startRename':
       renameNodeId=m.nodeId||null;
       renderTree();
@@ -421,10 +577,7 @@ window.addEventListener('message',function(e){
       break;
     case 'collapseAll':
       expandedIds.clear();
-      searchExpandedIds.clear();
-      savedExpandedIds=null;
-      for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
-      saveExp();renderTree();
+      renderTree();
       if(selectedIds.length>0)requestAnimationFrame(function(){scrollTo(selectedIds[0])});
       break;
     case 'showContextMenu':
@@ -435,75 +588,31 @@ window.addEventListener('message',function(e){
   }
 });
 
-/* ---- search ---- */
 var searchDebounce=null;
-function expandSearchMatches(){
-  visCache={};
-  searchExpandedIds=new Set(expandedIds);
-  function walk(id){
-    var n=nodes[id];if(!n)return;
-    if(!isVis(id))return;
-    if(n.children.length>0)searchExpandedIds.add(id);
-    for(var i=0;i<n.children.length;i++)walk(n.children[i]);
-  }
-  for(var i=0;i<rootIds.length;i++)walk(rootIds[i]);
-}
-function expandAncestors(id){
-  var n=nodes[id];if(!n)return;
-  for(var k in nodes){
-    var p=nodes[k];
-    if(p.children.indexOf(id)>=0){expandedIds.add(k);expandAncestors(k);return}
-  }
-}
+var searchFilter='';
 searchEl.addEventListener('input',function(){
   var raw=searchEl.value.trim().toLowerCase();
   if(searchDebounce)clearTimeout(searchDebounce);
-  if(!raw){
-    if(savedExpandedIds){expandedIds=savedExpandedIds;savedExpandedIds=null}
-    for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
-    saveExp();
-    searchFilter='';renderTree();return;
-  }
-  if(!savedExpandedIds)savedExpandedIds=new Set(expandedIds);
-  searchDebounce=setTimeout(function(){searchFilter=raw;expandSearchMatches();renderTree()},50);
+  searchDebounce=setTimeout(function(){searchFilter=raw;renderTree()},50);
 });
 searchEl.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
-    if(savedExpandedIds){expandedIds=savedExpandedIds;savedExpandedIds=null}
-    for(var i=0;i<selectedIds.length;i++)expandAncestors(selectedIds[i]);
-    saveExp();
     searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault();
   }
 });
 
-var visCache={};
-function isVis(id){
-  if(id in visCache)return visCache[id];
-  var n=nodes[id];
-  if(!n)return(visCache[id]=false);
-  if(n._nl.indexOf(searchFilter)>=0||n._cl.indexOf(searchFilter)>=0)return(visCache[id]=true);
-  for(var i=0;i<n.children.length;i++){if(isVis(n.children[i]))return(visCache[id]=true)}
-  return(visCache[id]=false);
-}
-
-function cancelRename(){
-  renameNodeId=null;
-  renderTree();
-}
+function cancelRename(){renameNodeId=null;renderTree()}
 function submitRename(inp){
   var row=inp.closest('.tree-row');
   if(!row)return;
   var id=row.dataset.id;
   var val=inp.value.trim();
   if(!val)cancelRename();
-  else{
-    vscode.postMessage({type:'renameInstance',nodeId:id,newName:val});
-    cancelRename();
-  }
+  else{vscode.postMessage({type:'renameInstance',nodeId:id,newName:val});cancelRename()}
 }
 function afterRenameInputMount(){
   if(!renameNodeId)return;
-  var inp=treeEl.querySelector('.tree-rename-input');
+  var inp=rowsEl.querySelector('.tree-rename-input');
   if(!inp)return;
   inp.focus();
   inp.select();
@@ -515,29 +624,36 @@ function afterRenameInputMount(){
   inp.addEventListener('click',function(ev){ev.stopPropagation()});
 }
 
-/* ---- tree rendering (virtual scroll) ---- */
 var ROW_HEIGHT=22;
 var OVERSCAN=10;
 var flatRows=[];
 var vLastStart=-1,vLastEnd=-1;
 var scrollRaf=false;
 
+function nodeMatches(n){
+  if(!searchFilter)return true;
+  return n.name.toLowerCase().indexOf(searchFilter)>=0||n.className.toLowerCase().indexOf(searchFilter)>=0;
+}
+
 function buildFlatRows(){
-  visCache={};
   flatRows=[];
   function walk(id,depth){
-    if(searchFilter&&!isVis(id))return;
     var n=nodes[id];if(!n)return;
-    var has=n.children.length>0;
-    var exp=activeExp().has(id);
     flatRows.push({id:id,depth:depth});
-    if(exp)for(var i=0;i<n.children.length;i++)walk(n.children[i],depth+1);
+    if(expandedIds.has(id)){
+      var kids=childrenByParent[id];
+      if(kids){for(var i=0;i<kids.length;i++)walk(kids[i],depth+1)}
+    }
   }
   for(var i=0;i<rootIds.length;i++)walk(rootIds[i],0);
+  if(searchFilter){
+    flatRows=flatRows.filter(function(r){var n=nodes[r.id];return n&&nodeMatches(n)});
+  }
 }
 
 function renderTree(){
   buildFlatRows();
+  spacerEl.style.height=(flatRows.length*ROW_HEIGHT)+'px';
   vLastStart=-1;vLastEnd=-1;
   renderViewport();
   if(renameNodeId)afterRenameInputMount();
@@ -553,28 +669,26 @@ function renderViewport(){
   var end=Math.min(flatRows.length,Math.ceil((scrollTop+viewH)/ROW_HEIGHT)+OVERSCAN);
   if(start===vLastStart&&end===vLastEnd)return;
   vLastStart=start;vLastEnd=end;
-  var topPad=start*ROW_HEIGHT;
-  var bottomPad=Math.max(0,(flatRows.length-end)*ROW_HEIGHT);
-  var h=['<div style="padding-top:'+topPad+'px;padding-bottom:'+bottomPad+'px">'];
+  var h=[];
   for(var i=start;i<end;i++){
     var r=flatRows[i];
-    buildRowHtml(r.id,r.depth,h);
+    buildRowHtml(r.id,r.depth,i,h);
   }
-  h.push('</div>');
-  treeEl.innerHTML=h.join('');
+  rowsEl.innerHTML=h.join('');
   if(renameNodeId)afterRenameInputMount();
 }
 
-function buildRowHtml(id,depth,h){
+function buildRowHtml(id,depth,rowIndex,h){
   var n=nodes[id];if(!n)return;
-  var has=n.children.length>0;
-  var exp=activeExp().has(id);
+  var has=n.hasChildren;
+  var exp=expandedIds.has(id);
   var sel=selectedIds.indexOf(id)>=0;
   var pad=depth*INDENT;
   var ac=has?(exp?' expanded':''):' leaf';
   var disabled=n.isScript&&n.disabled===true;
   var rowClass='tree-row'+(sel?' selected':'')+(depth>0?' tree-indent-guides':'')+(disabled?' script-disabled':'');
-  var style='padding-left:'+pad+'px';
+  var top=rowIndex*ROW_HEIGHT;
+  var style='top:'+top+'px;height:'+ROW_HEIGHT+'px;padding-left:'+pad+'px';
   if(depth>0){
     var bgs=[],pos=[],sz=[];
     for(var i=0;i<depth;i++){
@@ -603,9 +717,8 @@ treeEl.addEventListener('scroll',function(){
   requestAnimationFrame(function(){scrollRaf=false;renderViewport()});
 });
 
-/* ---- selection ---- */
 function updateSelVis(){
-  treeEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.toggle('selected',selectedIds.indexOf(r.dataset.id)>=0)});
+  rowsEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.toggle('selected',selectedIds.indexOf(r.dataset.id)>=0)});
 }
 function scrollTo(id){
   for(var i=0;i<flatRows.length;i++){
@@ -623,7 +736,15 @@ function scrollTo(id){
   }
 }
 
-/* ---- tree events ---- */
+function toggleExpand(id){
+  if(expandedIds.has(id)){expandedIds.delete(id)}
+  else{
+    expandedIds.add(id);
+    if(!childrenByParent[id])requestChildren(id);
+  }
+  renderTree();
+}
+
 treeEl.addEventListener('click',function(e){
   treeEl.focus();
   if(slowClickTimer){clearTimeout(slowClickTimer);slowClickTimer=null}
@@ -633,8 +754,7 @@ treeEl.addEventListener('click',function(e){
   var arrow=e.target.closest('.tree-arrow');
   if(arrow&&!arrow.classList.contains('leaf')){
     lastClickId=null;
-    var ae=activeExp();if(ae.has(id))ae.delete(id);else ae.add(id);
-    saveExp();renderTree();return;
+    toggleExpand(id);return;
   }
   if(e.target.closest('.tree-add-btn')){lastClickId=null;openQA(id,row);return}
   var now=Date.now();
@@ -645,10 +765,7 @@ treeEl.addEventListener('click',function(e){
     lastClickId=null;
     if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id});return}
     var node=nodes[id];
-    if(node&&node.children.length>0){
-      var ae=activeExp();if(ae.has(id))ae.delete(id);else ae.add(id);
-      saveExp();renderTree();
-    }
+    if(node&&node.hasChildren){toggleExpand(id)}
     return;
   }
   if(e.ctrlKey||e.metaKey){var i=selectedIds.indexOf(id);if(i>=0)selectedIds.splice(i,1);else selectedIds.push(id)}
@@ -675,8 +792,7 @@ treeEl.addEventListener('contextmenu',function(e){
   requestCtx(e.clientX,e.clientY,id);
 });
 
-/* ---- drag and drop ---- */
-function clearDragOver(){treeEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('drag-over')})}
+function clearDragOver(){rowsEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('drag-over')})}
 treeEl.addEventListener('dragstart',function(e){
   if(slowClickTimer){clearTimeout(slowClickTimer);slowClickTimer=null}
   lastClickId=null;
@@ -689,7 +805,7 @@ treeEl.addEventListener('dragstart',function(e){
 });
 treeEl.addEventListener('dragend',function(e){
   dragSourceId=null;
-  treeEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('dragging')});
+  rowsEl.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('dragging')});
   clearDragOver();
 });
 treeEl.addEventListener('dragover',function(e){
@@ -715,7 +831,6 @@ treeEl.addEventListener('drop',function(e){
   vscode.postMessage({type:'reparentNode',nodeId:sourceId,newParentId:targetId});
 });
 
-/* ---- context menu ---- */
 var ctxReqSeq=0;var ctxPending=null;
 function requestCtx(x,y,id){
   ctxPending={id:++ctxReqSeq,x:x,y:y,nodeId:id};
@@ -750,7 +865,6 @@ ctxEl.addEventListener('click',function(e){
 });
 document.addEventListener('click',function(e){if(!e.target.closest('#ctx-menu'))hideCtx()});
 
-/* ---- quick-add ---- */
 function openQA(parentId,rowEl){
   qaParentId=parentId;qaFiltered=CLASSES;qaIdx=0;qaSearchEl.value='';
   renderQA();qaEl.classList.remove('hidden');
@@ -820,7 +934,6 @@ qaListEl.addEventListener('mousemove',function(e){
 
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){hideCtx();closeQA()}});
 
-/* ---- keyboard shortcuts (only when tree area has focus, not search or quick-add) ---- */
 function isTreeFocused(){
   var ae=document.activeElement;
   if(!ae)return false;

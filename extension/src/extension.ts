@@ -18,8 +18,7 @@ let sourcemapParser: SourcemapParser;
 let propertiesViewProvider: PropertiesViewProvider;
 let explorerViewProvider: ExplorerViewProvider;
 let instanceHistory: InstanceHistory;
-let cachedQuickPickItems: (vscode.QuickPickItem & { node: Node })[] = [];
-let cachedSearchStrings: string[] = [];
+type QuickPickItemWithNode = vscode.QuickPickItem & { node: Node };
 
 export async function activate(context: vscode.ExtensionContext): Promise<VerdeApi> {
 	const outputChannel = vscode.window.createOutputChannel("Verde Backend");
@@ -33,44 +32,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 	sourcemapParser = new SourcemapParser(workspaceRoot);
 	instanceHistory = new InstanceHistory(10);
 
-	const rebuildQuickPickCache = () => {
-		const allNodes = explorerProvider.getAllNodes();
-		cachedSearchStrings = [];
-		cachedQuickPickItems = allNodes.map((node: Node) => {
-			const path: string[] = [node.name];
-			let current = node;
-			while (current.parentId) {
-				const parent = explorerProvider.getNodeById(current.parentId);
-				if (!parent) { break; }
-				path.unshift(parent.name);
-				current = parent;
-			}
-			const pathString = path.join('.');
-			cachedSearchStrings.push(pathString);
-			return {
-				label: node.name,
-				description: node.className,
-				detail: pathString,
-				iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", `${node.className}.png`),
-				alwaysShow: true,
-				node
-			};
-		});
-	};
-
 	backend = new VerdeBackend(outputChannel, statusBarItem, (snapshot) => {
 		explorerProvider.setSnapshot(snapshot);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
-		rebuildQuickPickCache();
+		explorerViewProvider?.notifySnapshotReplaced();
 	}, (ops, addedRootIds) => {
+		explorerViewProvider?.notifyDelta(ops);
 		explorerProvider.applyDelta(ops, addedRootIds);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
-		rebuildQuickPickCache();
 	}, () => {
 		explorerProvider.setSnapshot({ nodes: [], rootIds: [] });
 		instanceHistory.clear();
-		cachedQuickPickItems = [];
-		cachedSearchStrings = [];
+		explorerViewProvider?.notifySnapshotReplaced();
 	});
 
 	const sourcemapPath = vscode.workspace.getConfiguration('verde').get('sourcemapPath', 'sourcemap.json');
@@ -87,13 +60,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		const properties = Array.isArray(propertiesData.properties) ? propertiesData.properties : [];
 		const enabledProperty = properties.find((property: any) => property.name === "Enabled");
 		if (typeof enabledProperty?.value === "boolean") {
-			explorerProvider.setNodeDisabled(nodeId, !enabledProperty.value);
+			const next = !enabledProperty.value;
+			explorerProvider.setNodeDisabled(nodeId, next);
+			explorerViewProvider?.notifyDisabledChanged(nodeId, next);
 			return;
 		}
 
 		const disabledProperty = properties.find((property: any) => property.name === "Disabled");
 		if (typeof disabledProperty?.value === "boolean") {
 			explorerProvider.setNodeDisabled(nodeId, disabledProperty.value);
+			explorerViewProvider?.notifyDisabledChanged(nodeId, disabledProperty.value);
 		}
 	};
 
@@ -185,41 +161,67 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('verde.goToInstance', async () => {
-			const quickPick = vscode.window.createQuickPick<vscode.QuickPickItem & { node: Node }>();
+			const quickPick = vscode.window.createQuickPick<QuickPickItemWithNode>();
 			quickPick.placeholder = 'Type to search instances...';
 			quickPick.matchOnDetail = true;
 
 			let debounceTimer: NodeJS.Timeout | undefined;
+			let activeSearchToken = 0;
+			const CHUNK_SIZE = 5000;
+
+			const buildPathString = (node: Node): string => {
+				const path: string[] = [node.name];
+				let current: Node | undefined = node;
+				while (current?.parentId) {
+					const parent = explorerProvider.getNodeById(current.parentId);
+					if (!parent) break;
+					path.unshift(parent.name);
+					current = parent;
+				}
+				return path.join('.');
+			};
 
 			quickPick.onDidChangeValue(value => {
-				if (debounceTimer) {
-					clearTimeout(debounceTimer);
-				}
-
+				if (debounceTimer) clearTimeout(debounceTimer);
 				const query = value.trim().replace(/\s+/g, '.');
 				if (!query) {
+					activeSearchToken++;
 					quickPick.items = [];
+					quickPick.busy = false;
 					return;
 				}
-
 				quickPick.busy = true;
 				debounceTimer = setTimeout(() => {
-					const scored: { item: vscode.QuickPickItem & { node: Node }; score: number }[] = [];
-
-					for (let i = 0; i < cachedSearchStrings.length; i++) {
-						const str = cachedSearchStrings[i];
-						if (fzy.hasMatch(query, str)) {
-							scored.push({
-								item: cachedQuickPickItems[i],
-								score: fzy.score(query, str)
-							});
+					const myToken = ++activeSearchToken;
+					const all = explorerProvider.getAllNodes();
+					const scored: { node: Node; score: number }[] = [];
+					let i = 0;
+					const step = () => {
+						if (myToken !== activeSearchToken) return;
+						const end = Math.min(i + CHUNK_SIZE, all.length);
+						for (; i < end; i++) {
+							const n = all[i];
+							if (fzy.hasMatch(query, n.name)) {
+								scored.push({ node: n, score: fzy.score(query, n.name) });
+							}
 						}
-					}
-
-					scored.sort((a, b) => b.score - a.score);
-
-					quickPick.items = scored.slice(0, 50).map(r => r.item);
-					quickPick.busy = false;
+						if (i < all.length) {
+							setImmediate(step);
+							return;
+						}
+						scored.sort((a, b) => b.score - a.score);
+						const top = scored.slice(0, 50);
+						quickPick.items = top.map(r => ({
+							label: r.node.name,
+							description: r.node.className,
+							detail: buildPathString(r.node),
+							iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", `${r.node.className}.png`),
+							alwaysShow: true,
+							node: r.node,
+						}));
+						quickPick.busy = false;
+					};
+					step();
 				}, 50);
 			});
 

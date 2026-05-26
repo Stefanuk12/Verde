@@ -22,6 +22,7 @@ type Snapshot = {
 	nodes: { Node },
 }
 
+local YIELD_EVERY = 5000
 local MAX_DEPTH = 10000
 local MAX_NODES = math.huge
 
@@ -33,17 +34,8 @@ function SerializeDatamodel.serializeFull(): (Snapshot, { [string]: Instance })
 	local rootIds: { string } = {}
 	local nodeCount = 0
 
-	local function processInstance(instance: Instance, parentId: string, depth: number)
-		if depth >= MAX_DEPTH then
-			return
-		end
-
-		if nodeCount >= MAX_NODES then
-			return
-		end
-
+	local function makeNode(instance: Instance, parentId: string?): (Node, string)
 		local id = instance:GetDebugId(0)
-
 		local node: Node = {
 			id = id,
 			name = instance.Name,
@@ -51,34 +43,51 @@ function SerializeDatamodel.serializeFull(): (Snapshot, { [string]: Instance })
 			parentId = parentId,
 			children = {},
 		}
-
 		if instance:IsA("BaseScript") then
 			node.disabled = not instance.Enabled
 			node.runContext = (instance :: BaseScript).RunContext.Name
 		end
-
 		instanceMap[id] = instance
-
-		table.insert(nodes, node)
+		nodes[#nodes + 1] = node
 		nodeCount += 1
-
-		for _, child in instance:GetChildren() do
-			local childId = processInstance(child, id, depth + 1)
-
-			if childId then
-				table.insert(node.children, childId)
-			end
-		end
-
-		return id
+		return node, id
 	end
+
+	local stack: { { any } } = {}
 
 	for _, serviceName in Services do
 		local service = game:GetService(serviceName)
-		local serviceId = processInstance(service, nil, 0)
+		stack[#stack + 1] = { service, nil, 0 }
+	end
 
-		if serviceId then
-			table.insert(rootIds, serviceId)
+	while #stack > 0 do
+		local frame = stack[#stack]
+		stack[#stack] = nil
+
+		local instance: Instance = frame[1]
+		local parentNode: Node? = frame[2]
+		local depth: number = frame[3]
+
+		if depth >= MAX_DEPTH or nodeCount >= MAX_NODES then
+			continue
+		end
+
+		local parentId: string? = if parentNode then parentNode.id else nil
+		local node, id = makeNode(instance, parentId)
+
+		if parentNode then
+			parentNode.children[#parentNode.children + 1] = id
+		else
+			rootIds[#rootIds + 1] = id
+		end
+
+		local children = instance:GetChildren()
+		for i = #children, 1, -1 do
+			stack[#stack + 1] = { children[i], node, depth + 1 }
+		end
+
+		if nodeCount % YIELD_EVERY == 0 then
+			task.wait()
 		end
 	end
 
