@@ -1,6 +1,9 @@
 {
   "name": "Verde",
   "tree": {
-    "$path": "src/ServerStorage/Plugin"
+    "$className": "DataModel",
+    "ServerStorage": {
+      "$path": "src/ServerStorage"
+    }
   }
 }
