@@ -251,6 +251,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
           if (op.name !== undefined) patch.name = op.name;
           if (op.runContext !== undefined) patch.iconClassName = scriptIconClass(node.className, op.runContext);
           if (op.disabled !== undefined && isScriptClass(node.className)) patch.disabled = op.disabled;
+          if (op.hasChildren !== undefined) patch.hasChildren = op.hasChildren;
           if (Object.keys(patch).length > 0) updates.push({ id: op.id, patch });
           const pid = node.parentId ?? null;
           if (op.name !== undefined) {
