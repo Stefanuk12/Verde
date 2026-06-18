@@ -19,6 +19,9 @@ let propertiesViewProvider: PropertiesViewProvider;
 let explorerViewProvider: ExplorerViewProvider;
 let instanceHistory: InstanceHistory;
 type QuickPickItemWithNode = vscode.QuickPickItem & { node: Node };
+let cachedQuickPickItems: QuickPickItemWithNode[] = [];
+let cachedSearchStrings: string[] = [];
+let onQuickPickCacheRebuilt: (() => void) | null = null;
 
 export async function activate(context: vscode.ExtensionContext): Promise<VerdeApi> {
 	const outputChannel = vscode.window.createOutputChannel("Verde Backend");
@@ -32,18 +35,116 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 	sourcemapParser = new SourcemapParser(workspaceRoot);
 	instanceHistory = new InstanceHistory(10);
 
-	backend = new VerdeBackend(outputChannel, statusBarItem, (snapshot) => {
-		explorerProvider.setSnapshot(snapshot);
+	const revealOnNextSnapshot = (
+		editorUriToMatch: string | null,
+		lookup: () => Node | undefined,
+		onMissing?: () => void,
+		searchQuery?: string,
+	) => {
+		if (!backend) return;
+
+		const finishReveal = () => {
+			if (editorUriToMatch !== null) {
+				const current = vscode.window.activeTextEditor?.document.uri.toString();
+				if (current !== editorUriToMatch) return;
+			}
+			const refreshed = lookup();
+			if (refreshed) {
+				explorerViewProvider.reveal(refreshed);
+				if (editorUriToMatch !== null) {
+					vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+				}
+			} else if (onMissing) {
+				onMissing();
+			}
+		};
+
+		const trySearchFallback = (): boolean => {
+			if (!backend || !searchQuery || searchQuery.length < 2) return false;
+			if (explorerViewProvider.getFullSyncStatus() !== 'too_big') return false;
+			if (!backend.requestSearch(searchQuery)) return false;
+			waitForExplorerCondition(() => lookup() !== undefined).then(finishReveal);
+			return true;
+		};
+
+		const syncStatus = explorerViewProvider.getFullSyncStatus();
+		if (syncStatus !== 'unknown') {
+			const node = lookup();
+			if (node) explorerViewProvider.reveal(node);
+			else if (!trySearchFallback() && onMissing) onMissing();
+			return;
+		}
+		backend.requestSnapshot(true).then(finishReveal).catch(() => {
+			trySearchFallback();
+		});
+	};
+
+	const buildQuickPickItem = (node: Node, detail: string): vscode.QuickPickItem & { node: Node } => {
+		return {
+			label: node.name,
+			description: node.className,
+			detail,
+			iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", `${node.className}.png`),
+			alwaysShow: true,
+			node
+		};
+	};
+
+	const rebuildQuickPickCache = () => {
+		const allNodes = explorerProvider.getAllNodes();
+		cachedSearchStrings = [];
+		const pathCache = new Map<string, string>();
+		cachedQuickPickItems = allNodes.map((node: Node) => {
+			const detail = dottedPath(node, pathCache);
+			cachedSearchStrings.push(detail);
+			return buildQuickPickItem(node, detail);
+		});
+		if (onQuickPickCacheRebuilt) onQuickPickCacheRebuilt();
+	};
+
+	const appendQuickPickCache = (added: Node[]) => {
+		if (added.length === 0) return;
+		const pathCache = new Map<string, string>();
+		for (const node of added) {
+			const detail = dottedPath(node, pathCache);
+			cachedSearchStrings.push(detail);
+			cachedQuickPickItems.push(buildQuickPickItem(node, detail));
+		}
+		if (onQuickPickCacheRebuilt) onQuickPickCacheRebuilt();
+	};
+
+	backend = new VerdeBackend(outputChannel, statusBarItem, (snapshot, isFull) => {
+		if (isFull) {
+			explorerViewProvider?.markFullSyncSucceeded();
+		} else {
+			explorerViewProvider?.markPartialSnapshot();
+		}
+		explorerProvider.setSnapshot(snapshot, isFull);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
+		rebuildQuickPickCache();
 		explorerViewProvider?.notifySnapshotReplaced();
 	}, (ops, addedRootIds) => {
 		explorerViewProvider?.notifyDelta(ops);
-		explorerProvider.applyDelta(ops, addedRootIds);
+		const { added, needsRebuild } = explorerProvider.applyDelta(ops, addedRootIds);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
+		if (needsRebuild) {
+			rebuildQuickPickCache();
+		} else if (added.length > 0) {
+			appendQuickPickCache(added);
+		}
 	}, () => {
 		explorerProvider.setSnapshot({ nodes: [], rootIds: [] });
 		instanceHistory.clear();
+		cachedQuickPickItems = [];
+		cachedSearchStrings = [];
+		explorerViewProvider?.resetFullSyncStatus();
 		explorerViewProvider?.notifySnapshotReplaced();
+	}, (_query, nodes) => {
+		const added = explorerProvider.mergeSearchResults(nodes);
+		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
+		appendQuickPickCache(added);
+	}, () => {
+		explorerViewProvider?.markFullSyncTooBig();
 	});
 
 	const sourcemapPath = vscode.workspace.getConfiguration('verde').get('sourcemapPath', 'sourcemap.json');
@@ -133,9 +234,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 					const node = explorerProvider.getNodeByInstancePath(instancePath);
 					if (node) {
 						explorerViewProvider.reveal(node);
-
 						// force-refocus the text editor
 						await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+					} else if (backend) {
+						revealOnNextSnapshot(editor.document.uri.toString(), () =>
+							explorerProvider.getNodeByInstancePath(instancePath),
+							undefined, instancePath[instancePath.length - 1]);
 					}
 				}
 			} catch (error) {
@@ -153,6 +257,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 			const node = explorerProvider.getNodeById(instanceId);
 			if (node) {
 				explorerViewProvider.reveal(node);
+			} else if (backend) {
+				revealOnNextSnapshot(null, () => explorerProvider.getNodeById(instanceId), () => {
+					vscode.window.showWarningMessage(`Instance ${instanceId} not found in explorer`);
+				});
 			} else {
 				vscode.window.showWarningMessage(`Instance ${instanceId} not found in explorer`);
 			}
@@ -161,69 +269,73 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('verde.goToInstance', async () => {
+			let fullSyncUnavailable = explorerViewProvider.getFullSyncStatus() === 'too_big';
 			const quickPick = vscode.window.createQuickPick<QuickPickItemWithNode>();
 			quickPick.placeholder = 'Type to search instances...';
 			quickPick.matchOnDetail = true;
 
 			let debounceTimer: NodeJS.Timeout | undefined;
-			let activeSearchToken = 0;
-			const CHUNK_SIZE = 5000;
+			let lastRawQuery = '';
 
-			const buildPathString = (node: Node): string => {
-				const path: string[] = [node.name];
-				let current: Node | undefined = node;
-				while (current?.parentId) {
-					const parent = explorerProvider.getNodeById(current.parentId);
-					if (!parent) break;
-					path.unshift(parent.name);
-					current = parent;
+			const handleFullSnapshotUnavailable = () => {
+				fullSyncUnavailable = true;
+				if (backend && lastRawQuery.length >= 2) {
+					backend.requestSearch(lastRawQuery);
 				}
-				return path.join('.');
+			};
+
+			if (backend && explorerViewProvider.getFullSyncStatus() === 'unknown') {
+				backend.requestSnapshot(true).then(snapshot => {
+					if (snapshot === null) handleFullSnapshotUnavailable();
+				}).catch(handleFullSnapshotUnavailable);
+			}
+
+			const filterItems = (query: string) => {
+				const scored: { item: vscode.QuickPickItem & { node: Node }; score: number }[] = [];
+
+				for (let i = 0; i < cachedSearchStrings.length; i++) {
+					const str = cachedSearchStrings[i];
+					if (fzy.hasMatch(query, str)) {
+						scored.push({
+							item: cachedQuickPickItems[i],
+							score: fzy.score(query, str)
+						});
+					}
+				}
+
+				scored.sort((a, b) => b.score - a.score);
+
+				quickPick.items = scored.slice(0, 50).map(r => r.item);
+				quickPick.busy = false;
 			};
 
 			quickPick.onDidChangeValue(value => {
-				if (debounceTimer) clearTimeout(debounceTimer);
-				const query = value.trim().replace(/\s+/g, '.');
+				if (debounceTimer) {
+					clearTimeout(debounceTimer);
+				}
+
+				const rawQuery = value.trim();
+				const query = rawQuery.replace(/\s+/g, '.');
 				if (!query) {
-					activeSearchToken++;
+					lastRawQuery = '';
 					quickPick.items = [];
 					quickPick.busy = false;
 					return;
 				}
 				quickPick.busy = true;
+				lastRawQuery = rawQuery;
 				debounceTimer = setTimeout(() => {
-					const myToken = ++activeSearchToken;
-					const all = explorerProvider.getAllNodes();
-					const scored: { node: Node; score: number }[] = [];
-					let i = 0;
-					const step = () => {
-						if (myToken !== activeSearchToken) return;
-						const end = Math.min(i + CHUNK_SIZE, all.length);
-						for (; i < end; i++) {
-							const n = all[i];
-							if (fzy.hasMatch(query, n.name)) {
-								scored.push({ node: n, score: fzy.score(query, n.name) });
-							}
-						}
-						if (i < all.length) {
-							setImmediate(step);
-							return;
-						}
-						scored.sort((a, b) => b.score - a.score);
-						const top = scored.slice(0, 50);
-						quickPick.items = top.map(r => ({
-							label: r.node.name,
-							description: r.node.className,
-							detail: buildPathString(r.node),
-							iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", `${r.node.className}.png`),
-							alwaysShow: true,
-							node: r.node,
-						}));
-						quickPick.busy = false;
-					};
-					step();
+					if (fullSyncUnavailable && backend && rawQuery.length >= 2) {
+						backend.requestSearch(rawQuery);
+					}
+					filterItems(query);
 				}, 50);
 			});
+
+			const cacheRebuiltListener = () => {
+				if (lastRawQuery) filterItems(lastRawQuery.replace(/\s+/g, '.'));
+			};
+			onQuickPickCacheRebuilt = cacheRebuiltListener;
 
 			quickPick.onDidAccept(async () => {
 				const selected = quickPick.selectedItems[0];
@@ -251,7 +363,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				quickPick.hide();
 			});
 
-			quickPick.onDidHide(() => quickPick.dispose());
+			quickPick.onDidHide(() => {
+				if (onQuickPickCacheRebuilt === cacheRebuiltListener) {
+					onQuickPickCacheRebuilt = null;
+				}
+				quickPick.dispose();
+			});
 			quickPick.show();
 		})
 	);
@@ -259,7 +376,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 	context.subscriptions.push(
 		vscode.commands.registerCommand("verde.refreshExplorer", async () => {
 			if (backend) {
-				await backend.requestSnapshot();
+				await backend.requestSnapshot(true).catch((error: unknown) => {
+					if (error instanceof Error && error.message === "snapshot_request_abandoned") {
+						return;
+					}
+					return backend?.requestSnapshot(false);
+				});
 			}
 		})
 	);
@@ -343,10 +465,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 					if (!result.success) {
 						vscode.window.showErrorMessage(`Failed to rename instance: ${result.error}`);
 					} else if (isScript) {
-						await backend.waitForNextSnapshot();
+						const renameReflected = await waitForExplorerCondition(
+							() => explorerProvider.getNodeById(node.id)?.name === newName);
 						await sourcemapParser.loadSourcemaps();
 						const updatedNode = explorerProvider.getNodeById(node.id);
-						if (updatedNode) {
+						if (updatedNode && renameReflected) {
 							if (oldFileUri) {
 								const tabs = vscode.window.tabGroups.all.flatMap(tg => tg.tabs);
 								const tabToClose = tabs.find(tab => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === oldFileUri!.toString());
@@ -598,20 +721,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 				if (!result.success) {
 					vscode.window.showErrorMessage(`Failed to create instance: ${result.error}`);
-				} else {
-					await backend.waitForNextSnapshot();
+				} else if (result.data && typeof result.data === 'string') {
+					const newNodeId = result.data;
+					backend.requestChildren([parentNode.id]);
+					await waitForExplorerCondition(() => explorerProvider.getNodeById(newNodeId) !== undefined);
+					const newNode = explorerProvider.getNodeById(newNodeId);
+					if (newNode) {
+						explorerViewProvider.reveal(newNode);
 
-					if (result.data && typeof result.data === 'string') {
-						const newNodeId = result.data;
-						const newNode = explorerProvider.getNodeById(newNodeId);
-						if (newNode) {
-							explorerViewProvider.reveal(newNode);
-
-							if (isScriptClass(newNode.className)) {
-								waitForScriptInSourcemap(newNode, 2000).catch(error => {
-									console.debug('Failed to wait for script in sourcemap:', error);
-								});
-							}
+						if (isScriptClass(newNode.className)) {
+							waitForScriptInSourcemap(newNode, 2000).catch(error => {
+								console.debug('Failed to wait for script in sourcemap:', error);
+							});
 						}
 					}
 				}
@@ -760,6 +881,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		})
 	);
 
+	async function waitForExplorerCondition(predicate: () => boolean, timeoutMs: number = 3000): Promise<boolean> {
+		if (predicate()) {
+			return true;
+		}
+		return new Promise<boolean>(resolve => {
+			let settled = false;
+			const finish = (result: boolean) => {
+				if (settled) return;
+				settled = true;
+				dispose();
+				clearTimeout(timer);
+				resolve(result);
+			};
+			const dispose = explorerProvider.onChange(() => {
+				if (predicate()) finish(true);
+			});
+			const timer = setTimeout(() => finish(predicate()), timeoutMs);
+		});
+	}
+
 	function getInstancePath(node: Node): string[] {
 		const path: string[] = [node.name];
 		let current = node;
@@ -773,6 +914,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 			current = parent;
 		}
 
+		return path;
+	}
+
+	function dottedPath(node: Node, cache: Map<string, string>): string {
+		const cached = cache.get(node.id);
+		if (cached !== undefined) {
+			return cached;
+		}
+		const parent = node.parentId ? explorerProvider.getNodeById(node.parentId) : undefined;
+		const path = parent ? dottedPath(parent, cache) + '.' + node.name : node.name;
+		cache.set(node.id, path);
 		return path;
 	}
 

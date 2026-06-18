@@ -1,5 +1,6 @@
-return function(payload)
-	-- this operation exists to prevent the "unknown_operation_type" error
+local PropertyTracker = require(script.Parent.Parent.Shared.PropertyTracker)
 
+return function(_payload)
+	PropertyTracker.cleanupTracking()
 	return true
 end

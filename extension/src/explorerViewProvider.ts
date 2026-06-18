@@ -14,8 +14,11 @@ type WebviewNode = {
   iconClassName: string;
   hasChildren: boolean;
   isScript: boolean;
+  childrenLoaded?: boolean;
   disabled?: boolean;
 };
+
+type FullSyncStatus = "unknown" | "full" | "too_big";
 
 export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "verde.view";
@@ -24,6 +27,8 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   private selectedIds: string[] = [];
   private selectionListeners: ((nodes: Node[]) => void)[] = [];
   private knownParentIds: Set<string> = new Set();
+  private fullSyncStatus: FullSyncStatus = "unknown";
+  private pendingSearchQuery: string | null = null;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -31,6 +36,87 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     private readonly backend: VerdeBackend,
     private readonly contextMenuRegistry: ContextMenuRegistry,
   ) {}
+
+  public markFullSyncSucceeded(): void {
+    this.fullSyncStatus = "full";
+    this.pushSyncStatus();
+    this.resolvePendingSearch();
+  }
+
+  public markFullSyncTooBig(): void {
+    this.fullSyncStatus = "too_big";
+    this.pushSyncStatus();
+    this.resolvePendingSearch();
+  }
+
+  public resetFullSyncStatus(): void {
+    this.fullSyncStatus = "unknown";
+    this.pendingSearchQuery = null;
+    this.pushSyncStatus();
+  }
+
+  public getFullSyncStatus(): FullSyncStatus {
+    return this.fullSyncStatus;
+  }
+
+  public markPartialSnapshot(): void {
+    if (this.fullSyncStatus === "full") {
+      this.fullSyncStatus = "unknown";
+      this.pushSyncStatus();
+    }
+    this.tryResumePendingSearch();
+  }
+
+  private tryResumePendingSearch(): void {
+    if (this.fullSyncStatus !== "unknown") return;
+    if (this.pendingSearchQuery === null) return;
+    const query = this.pendingSearchQuery;
+    this.backend.requestSnapshot(true).then(snapshot => {
+      if (snapshot === null && this.pendingSearchQuery === query) {
+        this.pendingSearchQuery = null;
+      }
+    }).catch(() => {
+      if (this.pendingSearchQuery === query) this.pendingSearchQuery = null;
+    });
+  }
+
+  private resolvePendingSearch(): void {
+    if (this.pendingSearchQuery === null) return;
+
+    const query = this.pendingSearchQuery;
+    this.pendingSearchQuery = null;
+
+    if (this.fullSyncStatus === "too_big" && query.length >= 2) {
+      this.backend.requestSearch(query);
+    }
+  }
+
+  private handleSearchInput(query: string): void {
+    if (query === "") {
+      this.pendingSearchQuery = null;
+      this.backend.requestSearch("");
+      return;
+    }
+
+    if (this.fullSyncStatus === "full") {
+      return;
+    }
+
+    if (this.fullSyncStatus === "too_big") {
+      if (query.length < 2) return;
+      this.backend.requestSearch(query);
+      return;
+    }
+
+    this.pendingSearchQuery = query;
+    this.backend.requestSnapshot(true).then(snapshot => {
+      if (snapshot === null && this.pendingSearchQuery === query) {
+        this.pendingSearchQuery = null;
+      }
+    }).catch(() => {
+      if (this.pendingSearchQuery === query) this.pendingSearchQuery = null;
+    });
+  }
 
   public onSelectionChanged(listener: (nodes: Node[]) => void): void {
     this.selectionListeners.push(listener);
@@ -107,6 +193,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     ).toString();
     webviewView.webview.html = this.buildHtml(webviewView.webview, assetBase);
     this.pushSnapshot();
+    this.pushSyncStatus();
     this.pushSelectionColor();
   }
 
@@ -117,6 +204,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     ).toString();
     this.webviewView.webview.html = this.buildHtml(this.webviewView.webview, assetBase);
     this.pushSnapshot();
+    this.pushSyncStatus();
   }
 
   public notifySnapshotReplaced(): void {
@@ -210,9 +298,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       name: n.name,
       className: n.className,
       iconClassName: scriptIconClass(n.className, n.runContext),
-      hasChildren: n.children.length > 0,
+      hasChildren: n.hasChildren === true || n.children.length > 0,
       isScript,
     };
+    if (n.childrenLoaded) w.childrenLoaded = true;
     if (isScript) w.disabled = !!n.disabled;
     return w;
   }
@@ -227,6 +316,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       rootNodes,
       selectedIds: this.selectedIds,
     });
+  }
+
+  private pushSyncStatus(): void {
+    this.post({ type: "updateSyncStatus", status: this.fullSyncStatus });
   }
 
   private fireSelectionChanged(): void {
@@ -246,6 +339,12 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         const nodes = this.serializeChildren(key);
         this.knownParentIds.add(parentId);
         this.post({ type: "children", parentId, nodes });
+        if (key !== null) {
+          const node = this.explorerProvider.getNodeById(key);
+          if (node && node.hasChildren === true && node.childrenLoaded !== true) {
+            this.backend.requestChildren([key]);
+          }
+        }
         break;
       }
       case "requestAncestors": {
@@ -302,6 +401,21 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         this.post({ type: "showContextMenu", requestId: msg.requestId, nodeId: node.id, items });
         break;
       }
+      case "requestSearch": {
+        const query = typeof msg.query === "string" ? msg.query : "";
+        this.handleSearchInput(query);
+        break;
+      }
+      case "releaseSubtree": {
+        const parentIds = Array.isArray(msg.parentIds)
+          ? msg.parentIds.filter((id: unknown): id is string => typeof id === "string")
+          : [];
+        if (parentIds.length > 0) {
+          const descendantIds = this.explorerProvider.markSubtreeUnloaded(parentIds);
+          this.backend.releaseSubtree(parentIds, descendantIds);
+        }
+        break;
+      }
       case "reparentNode": {
         const nodeId = msg.nodeId as string | undefined;
         const newParentId = msg.newParentId as string | undefined;
@@ -344,6 +458,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (result.data && typeof result.data === "string") {
+        this.backend.requestChildren([parentId]);
         const newNode = await this.waitForNode(result.data);
         if (newNode) {
           this.reveal(newNode);
@@ -464,6 +579,9 @@ var lastClickTime=0,lastClickId=null;
 
 var expandedIds=new Set();
 var dragSourceId=null;
+var saved=vscode.getState();
+if(saved&&Array.isArray(saved.exp))expandedIds=new Set(saved.exp);
+function saveExp(){vscode.setState({exp:[...expandedIds]})}
 
 function ingestNodes(arr){
   if(!arr)return;
@@ -477,6 +595,25 @@ function storeChildren(parentId,arr){
 }
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+var lastSearchQuerySent=null;
+var localSyncStatus='unknown';
+function sendSearchQuery(q){
+  if(localSyncStatus==='full')return;
+  if(q===lastSearchQuerySent)return;
+  lastSearchQuerySent=q;
+  vscode.postMessage({type:'requestSearch',query:q});
+}
+function releaseSubtree(id){
+  if(localSyncStatus==='full')return;
+  if(searchFilter)return;
+  var n=nodes[id];
+  if(!n||n.childrenLoaded!==true)return;
+  if(childrenByParent[id]===undefined&&!pendingChildren[id])return;
+  delete childrenByParent[id];
+  delete pendingChildren[id];
+  vscode.postMessage({type:'releaseSubtree',parentIds:[id]});
+}
 
 var treeEl=document.getElementById('tree');
 var spacerEl=document.getElementById('tree-spacer');
@@ -505,6 +642,8 @@ window.addEventListener('message',function(e){
       rootIds=[];for(var i=0;i<(m.rootNodes||[]).length;i++)rootIds.push(m.rootNodes[i].id);
       childrenByParent['']=rootIds.slice();
       selectedIds=m.selectedIds||[];
+      lastSearchQuerySent=null;
+      if(searchFilter)sendSearchQuery(searchFilter);
       renderTree();break;
     case 'children':
       delete pendingChildren[m.parentId];
@@ -533,6 +672,9 @@ window.addEventListener('message',function(e){
         renderTree();
       }
       break;
+    case 'updateSyncStatus':
+      localSyncStatus=m.status||'unknown';
+      break;
     case 'updateSelection':
       selectedIds=m.selectedIds||[];updateSelVis();break;
     case 'revealNode':
@@ -541,7 +683,7 @@ window.addEventListener('message',function(e){
       for(var pid in pre){storeChildren(pid,pre[pid])}
       for(var i=0;i<chain.length;i++)expandedIds.add(chain[i]);
       selectedIds=m.selectedIds||[];
-      renderTree();
+      saveExp();renderTree();
       requestAnimationFrame(function(){scrollTo(m.nodeId);treeEl.focus()});break;
     case 'focusTree':
       treeEl.focus();break;
@@ -552,7 +694,7 @@ window.addEventListener('message',function(e){
         expandedIds.add(id);
         if(!childrenByParent[id])requestChildren(id);
       });
-      renderTree();break;
+      saveExp();renderTree();break;
     case 'startRename':
       renameNodeId=m.nodeId||null;
       renderTree();
@@ -576,8 +718,15 @@ window.addEventListener('message',function(e){
       }
       break;
     case 'collapseAll':
+      if(localSyncStatus!=='full'&&!searchFilter){
+        var loadedRoots=rootIds.filter(function(rid){return childrenByParent[rid]!==undefined});
+        if(loadedRoots.length>0){
+          for(var i=0;i<loadedRoots.length;i++){delete childrenByParent[loadedRoots[i]];delete pendingChildren[loadedRoots[i]]}
+          vscode.postMessage({type:'releaseSubtree',parentIds:loadedRoots});
+        }
+      }
       expandedIds.clear();
-      renderTree();
+      saveExp();renderTree();
       if(selectedIds.length>0)requestAnimationFrame(function(){scrollTo(selectedIds[0])});
       break;
     case 'showContextMenu':
@@ -593,10 +742,21 @@ var searchFilter='';
 searchEl.addEventListener('input',function(){
   var raw=searchEl.value.trim().toLowerCase();
   if(searchDebounce)clearTimeout(searchDebounce);
-  searchDebounce=setTimeout(function(){searchFilter=raw;renderTree()},50);
+  if(!raw){
+    lastSearchQuerySent=null;
+    sendSearchQuery('');
+    searchFilter='';renderTree();return;
+  }
+  searchDebounce=setTimeout(function(){
+    sendSearchQuery(raw);
+    searchFilter=raw;renderTree();
+  },50);
 });
 searchEl.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
+    if(searchDebounce){clearTimeout(searchDebounce);searchDebounce=null}
+    lastSearchQuerySent=null;
+    sendSearchQuery('');
     searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault();
   }
 });
@@ -642,7 +802,8 @@ function buildFlatRows(){
     flatRows.push({id:id,depth:depth});
     if(expandedIds.has(id)){
       var kids=childrenByParent[id];
-      if(kids){for(var i=0;i<kids.length;i++)walk(kids[i],depth+1)}
+      if(kids===undefined){if(!searchFilter&&n.hasChildren===true)requestChildren(id)}
+      else{for(var i=0;i<kids.length;i++)walk(kids[i],depth+1)}
     }
   }
   for(var i=0;i<rootIds.length;i++)walk(rootIds[i],0);
@@ -680,7 +841,7 @@ function renderViewport(){
 
 function buildRowHtml(id,depth,rowIndex,h){
   var n=nodes[id];if(!n)return;
-  var has=n.hasChildren;
+  var has=n.hasChildren===true;
   var exp=expandedIds.has(id);
   var sel=selectedIds.indexOf(id)>=0;
   var pad=depth*INDENT;
@@ -737,11 +898,12 @@ function scrollTo(id){
 }
 
 function toggleExpand(id){
-  if(expandedIds.has(id)){expandedIds.delete(id)}
+  if(expandedIds.has(id)){expandedIds.delete(id);releaseSubtree(id)}
   else{
     expandedIds.add(id);
     if(!childrenByParent[id])requestChildren(id);
   }
+  saveExp();
   renderTree();
 }
 
@@ -765,7 +927,7 @@ treeEl.addEventListener('click',function(e){
     lastClickId=null;
     if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id});return}
     var node=nodes[id];
-    if(node&&node.hasChildren){toggleExpand(id)}
+    if(node&&node.hasChildren===true){toggleExpand(id)}
     return;
   }
   if(e.ctrlKey||e.metaKey){var i=selectedIds.indexOf(id);if(i>=0)selectedIds.splice(i,1);else selectedIds.push(id)}
