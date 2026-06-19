@@ -1,4 +1,4 @@
-local SharedFolder = script.Parent.Parent.Shared
+local SharedFolder = require(script.Parent.Parent.Shared)
 
 local WebSocketClient = require(script.Parent.Parent.WebSocketClient)
 local Config = SharedFolder.Config

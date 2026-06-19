@@ -1,6 +1,6 @@
 local HttpService = game:GetService("HttpService")
 
-local SharedFolder = script.Parent.Parent.Shared
+local SharedFolder = require(script.Parent.Parent.Shared)
 
 local SerializeDatamodel = require(script.Parent.Parent.SerializeDatamodel)
 local isValidInstance = require(script.Parent.Parent.Utils.isValidInstance)
