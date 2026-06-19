@@ -192,8 +192,7 @@ function SerializeDatamodel.serializeSearchResults(
 
 		visited[id] = true
 
-		local node = makeNode(instance, parentId)
-		node.hasChildren = #instance:GetChildren() > 0
+		local node = SerializeDatamodel.serializeShallow(instance, parentId)
 
 		instanceMap[id] = instance
 		table.insert(nodes, node)
@@ -246,10 +245,18 @@ function SerializeDatamodel.serializeSearchResults(
 		return true
 	end
 
+	local considered = 0
 	local function consider(instance: Instance): boolean
 		if #nodes >= MAX_SEARCH_RESULTS then
 			truncated = true
 			return false
+		end
+		considered += 1
+		if considered % YIELD_EVERY == 0 then
+			task.wait()
+		end
+		if instance.Parent == nil then
+			return true
 		end
 		if matches(instance) then
 			table.insert(matched, instance)

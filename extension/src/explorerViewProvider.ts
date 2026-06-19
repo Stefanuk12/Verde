@@ -3,7 +3,7 @@ import { RobloxExplorerProvider, Node } from "./robloxExplorerProvider";
 import { ExplorerDeltaOp } from "./backend";
 import { VerdeBackend } from "./backend";
 import { getClassNames } from "./robloxClasses";
-import { isScriptClass, scriptIconClass } from "./utils";
+import { isScriptClass, scriptIconClass, buildDottedPath } from "./utils";
 import { getThemeCssBlock, getThemeScriptBlock, getThemeStyleAttribute } from "./webviewTheme";
 import { ContextMenuRegistry } from "./contextMenuRegistry";
 
@@ -20,6 +20,8 @@ type WebviewNode = {
 
 type FullSyncStatus = "unknown" | "full" | "too_big";
 
+const MAX_LOCAL_SEARCH_RESULTS = 500;
+
 export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "verde.view";
 
@@ -29,6 +31,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   private knownParentIds: Set<string> = new Set();
   private fullSyncStatus: FullSyncStatus = "unknown";
   private pendingSearchQuery: string | null = null;
+  private currentSearchQuery: string = "";
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -51,7 +54,6 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
   public resetFullSyncStatus(): void {
     this.fullSyncStatus = "unknown";
-    this.pendingSearchQuery = null;
     this.pushSyncStatus();
   }
 
@@ -70,7 +72,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   private tryResumePendingSearch(): void {
     if (this.fullSyncStatus !== "unknown") return;
     if (this.pendingSearchQuery === null) return;
-    const query = this.pendingSearchQuery;
+    this.requestFullSnapshotForQuery(this.pendingSearchQuery);
+  }
+
+  private requestFullSnapshotForQuery(query: string): void {
     this.backend.requestSnapshot(true).then(snapshot => {
       if (snapshot === null && this.pendingSearchQuery === query) {
         this.pendingSearchQuery = null;
@@ -85,37 +90,93 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
     const query = this.pendingSearchQuery;
     this.pendingSearchQuery = null;
-
-    if (this.fullSyncStatus === "too_big" && query.length >= 2) {
-      this.backend.requestSearch(query);
+    if (query === this.currentSearchQuery) {
+      this.handleSearchInput(query);
     }
   }
 
   private handleSearchInput(query: string): void {
+    this.currentSearchQuery = query;
+
     if (query === "") {
       this.pendingSearchQuery = null;
       this.backend.requestSearch("");
+      this.postSearchResults("", []);
       return;
     }
 
     if (this.fullSyncStatus === "full") {
+      this.pendingSearchQuery = null;
+      this.postSearchResults(query, this.computeLocalMatches(query));
       return;
     }
 
     if (this.fullSyncStatus === "too_big") {
-      if (query.length < 2) return;
-      this.backend.requestSearch(query);
+      this.pendingSearchQuery = null;
+      if (query.length < 2) {
+        this.postSearchResults(query, []);
+        return;
+      }
+      if (!this.backend.requestSearch(query)) {
+        this.postSearchResults(query, []);
+      }
       return;
     }
 
     this.pendingSearchQuery = query;
-    this.backend.requestSnapshot(true).then(snapshot => {
-      if (snapshot === null && this.pendingSearchQuery === query) {
-        this.pendingSearchQuery = null;
+    this.requestFullSnapshotForQuery(query);
+  }
+
+  public handleSearchResults(query: string, nodes: Node[]): void {
+    if (this.fullSyncStatus !== "too_big") return;
+    if (query.toLowerCase() !== this.currentSearchQuery) return;
+
+    const tokens = this.searchTokens(this.currentSearchQuery);
+    const pathCache = new Map<string, string>();
+    const rows: WebviewNode[] = [];
+    for (const raw of nodes) {
+      const node = this.explorerProvider.getNodeById(raw.id) ?? raw;
+      if (this.matchesTokens(node, tokens, pathCache)) {
+        rows.push(this.serializeNode(node));
       }
-    }).catch(() => {
-      if (this.pendingSearchQuery === query) this.pendingSearchQuery = null;
-    });
+    }
+    this.postSearchResults(this.currentSearchQuery, rows);
+  }
+
+  private postSearchResults(query: string, nodes: WebviewNode[]): void {
+    this.post({ type: "searchResults", query, nodes });
+  }
+
+  private searchTokens(query: string): string[] {
+    return query.toLowerCase().split(/[\s.]+/).filter(t => t.length > 0);
+  }
+
+  private computeLocalMatches(query: string): WebviewNode[] {
+    const tokens = this.searchTokens(query);
+    if (tokens.length === 0) return [];
+    const pathCache = new Map<string, string>();
+    const rows: WebviewNode[] = [];
+    for (const node of this.explorerProvider.getAllNodes()) {
+      if (this.matchesTokens(node, tokens, pathCache)) {
+        rows.push(this.serializeNode(node));
+        if (rows.length >= MAX_LOCAL_SEARCH_RESULTS) break;
+      }
+    }
+    return rows;
+  }
+
+  private matchesTokens(node: Node, tokens: string[], pathCache: Map<string, string>): boolean {
+    if (tokens.length === 0) return false;
+    const path = this.lowerPath(node, pathCache);
+    const className = node.className.toLowerCase();
+    for (const token of tokens) {
+      if (path.indexOf(token) < 0 && className.indexOf(token) < 0) return false;
+    }
+    return true;
+  }
+
+  private lowerPath(node: Node, cache: Map<string, string>): string {
+    return buildDottedPath(node, (id) => this.explorerProvider.getNodeById(id), cache, true);
   }
 
   public onSelectionChanged(listener: (nodes: Node[]) => void): void {
@@ -145,19 +206,32 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "collapseAll" });
   }
 
-  public reveal(node: Node): void {
+  private buildAncestorPreload(node: Node): { chain: string[]; preload: Record<string, WebviewNode[]> } {
     const chain: string[] = [];
     let cur: Node | undefined = node;
     while (cur?.parentId) {
       chain.unshift(cur.parentId);
       cur = this.explorerProvider.getNodeById(cur.parentId);
     }
-    this.selectedIds = [node.id];
     const preload: Record<string, WebviewNode[]> = {};
+    const incompleteAncestors: string[] = [];
     for (const parentId of chain) {
       preload[parentId] = this.serializeChildren(parentId);
       this.knownParentIds.add(parentId);
+      const parentNode = this.explorerProvider.getNodeById(parentId);
+      if (parentNode && parentNode.hasChildren === true && parentNode.childrenLoaded !== true) {
+        incompleteAncestors.push(parentId);
+      }
     }
+    if (incompleteAncestors.length > 0) {
+      this.backend.requestChildren(incompleteAncestors);
+    }
+    return { chain, preload };
+  }
+
+  public reveal(node: Node): void {
+    const { chain, preload } = this.buildAncestorPreload(node);
+    this.selectedIds = [node.id];
     this.post({
       type: "revealNode",
       nodeId: node.id,
@@ -208,8 +282,12 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public notifySnapshotReplaced(): void {
-    this.knownParentIds.clear();
     this.pushSnapshot();
+  }
+
+  private invalidateParent(invalidate: Set<string>, parentId: string | null): void {
+    if (parentId === null) invalidate.add("");
+    else if (this.knownParentIds.has(parentId)) invalidate.add(parentId);
   }
 
   public notifyDelta(ops: ExplorerDeltaOp[]): void {
@@ -219,29 +297,19 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     for (const op of ops) {
       switch (op.type) {
         case "add_subtree": {
-          const pid = op.parentId;
-          if (pid === null) {
-            invalidate.add("");
-          } else if (this.knownParentIds.has(pid)) {
-            invalidate.add(pid);
-          }
+          this.invalidateParent(invalidate, op.parentId);
           break;
         }
         case "remove_node": {
           const node = this.explorerProvider.getNodeById(op.id);
-          const pid = node?.parentId ?? null;
-          if (pid === null) invalidate.add("");
-          else if (this.knownParentIds.has(pid)) invalidate.add(pid);
+          this.invalidateParent(invalidate, node?.parentId ?? null);
+          this.knownParentIds.delete(op.id);
           break;
         }
         case "move_node": {
           const existing = this.explorerProvider.getNodeById(op.id);
-          const oldPid = existing?.parentId ?? null;
-          const newPid = op.newParentId;
-          if (oldPid === null) invalidate.add("");
-          else if (this.knownParentIds.has(oldPid)) invalidate.add(oldPid);
-          if (newPid === null) invalidate.add("");
-          else if (this.knownParentIds.has(newPid)) invalidate.add(newPid);
+          this.invalidateParent(invalidate, existing?.parentId ?? null);
+          this.invalidateParent(invalidate, op.newParentId);
           break;
         }
         case "update_node": {
@@ -251,12 +319,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
           if (op.name !== undefined) patch.name = op.name;
           if (op.runContext !== undefined) patch.iconClassName = scriptIconClass(node.className, op.runContext);
           if (op.disabled !== undefined && isScriptClass(node.className)) patch.disabled = op.disabled;
-          if (op.hasChildren !== undefined) patch.hasChildren = op.hasChildren;
+          if (op.hasChildren === true) patch.hasChildren = true;
           if (Object.keys(patch).length > 0) updates.push({ id: op.id, patch });
-          const pid = node.parentId ?? null;
           if (op.name !== undefined) {
-            if (pid === null) invalidate.add("");
-            else if (this.knownParentIds.has(pid)) invalidate.add(pid);
+            this.invalidateParent(invalidate, node.parentId ?? null);
           }
           break;
         }
@@ -272,6 +338,12 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
   public notifyDisabledChanged(id: string, disabled: boolean): void {
     this.post({ type: "updateNode", id, patch: { disabled } });
+  }
+
+  public notifyHasChildrenCleared(ids: string[]): void {
+    for (const id of ids) {
+      this.post({ type: "updateNode", id, patch: { hasChildren: false } });
+    }
   }
 
   private post(msg: unknown): void {
@@ -351,19 +423,9 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       case "requestAncestors": {
         const targetId = msg.nodeId as string;
         const target = this.explorerProvider.getNodeById(targetId);
-        const chain: string[] = [];
-        const preload: Record<string, WebviewNode[]> = {};
-        if (target) {
-          let cur: Node | undefined = target;
-          while (cur?.parentId) {
-            chain.unshift(cur.parentId);
-            cur = this.explorerProvider.getNodeById(cur.parentId);
-          }
-          for (const pid of chain) {
-            preload[pid] = this.serializeChildren(pid);
-            this.knownParentIds.add(pid);
-          }
-        }
+        const { chain, preload } = target
+          ? this.buildAncestorPreload(target)
+          : { chain: [] as string[], preload: {} as Record<string, WebviewNode[]> };
         this.post({ type: "ancestors", nodeId: targetId, chain, preload });
         break;
       }
@@ -413,6 +475,8 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
           : [];
         if (parentIds.length > 0) {
           const descendantIds = this.explorerProvider.markSubtreeUnloaded(parentIds);
+          for (const id of parentIds) { this.knownParentIds.delete(id); }
+          for (const id of descendantIds) { this.knownParentIds.delete(id); }
           this.backend.releaseSubtree(parentIds, descendantIds);
         }
         break;
@@ -593,14 +657,15 @@ function storeChildren(parentId,arr){
   var ids=[];
   for(var i=0;i<arr.length;i++)ids.push(arr[i].id);
   childrenByParent[parentId]=ids;
+  if(nodes[parentId])nodes[parentId].childrenLoaded=true;
 }
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
 var lastSearchQuerySent=null;
 var localSyncStatus='unknown';
+var searchResultIds=null;
 function sendSearchQuery(q){
-  if(localSyncStatus==='full')return;
   if(q===lastSearchQuerySent)return;
   lastSearchQuerySent=q;
   vscode.postMessage({type:'requestSearch',query:q});
@@ -643,8 +708,13 @@ window.addEventListener('message',function(e){
       rootIds=[];for(var i=0;i<(m.rootNodes||[]).length;i++)rootIds.push(m.rootNodes[i].id);
       childrenByParent['']=rootIds.slice();
       selectedIds=m.selectedIds||[];
-      lastSearchQuerySent=null;
+      lastSearchQuerySent=null;searchResultIds=null;
       if(searchFilter)sendSearchQuery(searchFilter);
+      renderTree();break;
+    case 'searchResults':
+      if(m.query!==searchFilter)break;
+      ingestNodes(m.nodes||[]);
+      searchResultIds=[];for(var i=0;i<(m.nodes||[]).length;i++)searchResultIds.push(m.nodes[i].id);
       renderTree();break;
     case 'children':
       delete pendingChildren[m.parentId];
@@ -720,10 +790,11 @@ window.addEventListener('message',function(e){
       break;
     case 'collapseAll':
       if(localSyncStatus!=='full'&&!searchFilter){
-        var loadedRoots=rootIds.filter(function(rid){return childrenByParent[rid]!==undefined});
-        if(loadedRoots.length>0){
-          for(var i=0;i<loadedRoots.length;i++){delete childrenByParent[loadedRoots[i]];delete pendingChildren[loadedRoots[i]]}
-          vscode.postMessage({type:'releaseSubtree',parentIds:loadedRoots});
+        var loadedParentIds=[];
+        for(var pid in childrenByParent){if(pid!==''&&childrenByParent[pid]!==undefined)loadedParentIds.push(pid)}
+        if(loadedParentIds.length>0){
+          for(var i=0;i<loadedParentIds.length;i++){delete childrenByParent[loadedParentIds[i]];delete pendingChildren[loadedParentIds[i]]}
+          vscode.postMessage({type:'releaseSubtree',parentIds:loadedParentIds});
         }
       }
       expandedIds.clear();
@@ -744,7 +815,7 @@ searchEl.addEventListener('input',function(){
   var raw=searchEl.value.trim().toLowerCase();
   if(searchDebounce)clearTimeout(searchDebounce);
   if(!raw){
-    lastSearchQuerySent=null;
+    lastSearchQuerySent=null;searchResultIds=null;
     sendSearchQuery('');
     searchFilter='';renderTree();return;
   }
@@ -756,7 +827,7 @@ searchEl.addEventListener('input',function(){
 searchEl.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
     if(searchDebounce){clearTimeout(searchDebounce);searchDebounce=null}
-    lastSearchQuerySent=null;
+    lastSearchQuerySent=null;searchResultIds=null;
     sendSearchQuery('');
     searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault();
   }
@@ -791,26 +862,23 @@ var flatRows=[];
 var vLastStart=-1,vLastEnd=-1;
 var scrollRaf=false;
 
-function nodeMatches(n){
-  if(!searchFilter)return true;
-  return n.name.toLowerCase().indexOf(searchFilter)>=0||n.className.toLowerCase().indexOf(searchFilter)>=0;
-}
-
 function buildFlatRows(){
   flatRows=[];
+  if(searchFilter){
+    var ids=searchResultIds||[];
+    for(var i=0;i<ids.length;i++){if(nodes[ids[i]])flatRows.push({id:ids[i],depth:0})}
+    return;
+  }
   function walk(id,depth){
     var n=nodes[id];if(!n)return;
     flatRows.push({id:id,depth:depth});
     if(expandedIds.has(id)){
       var kids=childrenByParent[id];
-      if(kids===undefined){if(!searchFilter&&n.hasChildren===true)requestChildren(id)}
+      if(kids===undefined){if(n.hasChildren===true)requestChildren(id)}
       else{for(var i=0;i<kids.length;i++)walk(kids[i],depth+1)}
     }
   }
   for(var i=0;i<rootIds.length;i++)walk(rootIds[i],0);
-  if(searchFilter){
-    flatRows=flatRows.filter(function(r){var n=nodes[r.id];return n&&nodeMatches(n)});
-  }
 }
 
 function renderTree(){

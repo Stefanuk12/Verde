@@ -5,7 +5,7 @@ import { VerdeBackend } from "./backend";
 import { PropertiesViewProvider } from "./propertiesViewProvider";
 import { getClassNames, initClassNames } from "./robloxClasses";
 import { SourcemapParser } from "./sourcemapParser";
-import { isScriptClass } from "./utils";
+import { isScriptClass, buildDottedPath } from "./utils";
 import { InstanceHistory, HistoryEntry } from "./instanceHistory";
 import { ContextMenuRegistry } from "./contextMenuRegistry";
 import { LuauExecutionService } from "./luauExecutionService";
@@ -90,42 +90,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		};
 	};
 
-	const rebuildQuickPickCache = () => {
-		const allNodes = explorerProvider.getAllNodes();
-		cachedSearchStrings = [];
-		const pathCache = new Map<string, string>();
-		cachedQuickPickItems = allNodes.map((node: Node) => {
+	const addNodesToQuickPickCache = (nodes: Node[], pathCache: Map<string, string>) => {
+		for (const node of nodes) {
 			const detail = dottedPath(node, pathCache);
 			cachedSearchStrings.push(detail);
-			return buildQuickPickItem(node, detail);
-		});
+			cachedQuickPickItems.push(buildQuickPickItem(node, detail));
+		}
+	};
+
+	const rebuildQuickPickCache = () => {
+		cachedSearchStrings = [];
+		cachedQuickPickItems = [];
+		addNodesToQuickPickCache(explorerProvider.getAllNodes(), new Map<string, string>());
 		if (onQuickPickCacheRebuilt) onQuickPickCacheRebuilt();
 	};
 
 	const appendQuickPickCache = (added: Node[]) => {
 		if (added.length === 0) return;
-		const pathCache = new Map<string, string>();
-		for (const node of added) {
-			const detail = dottedPath(node, pathCache);
-			cachedSearchStrings.push(detail);
-			cachedQuickPickItems.push(buildQuickPickItem(node, detail));
-		}
+		addNodesToQuickPickCache(added, new Map<string, string>());
 		if (onQuickPickCacheRebuilt) onQuickPickCacheRebuilt();
 	};
 
 	backend = new VerdeBackend(outputChannel, statusBarItem, (snapshot, isFull) => {
+		explorerProvider.setSnapshot(snapshot, isFull);
+		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
+		rebuildQuickPickCache();
+		explorerViewProvider?.notifySnapshotReplaced();
 		if (isFull) {
 			explorerViewProvider?.markFullSyncSucceeded();
 		} else {
 			explorerViewProvider?.markPartialSnapshot();
 		}
-		explorerProvider.setSnapshot(snapshot, isFull);
-		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
-		rebuildQuickPickCache();
-		explorerViewProvider?.notifySnapshotReplaced();
 	}, (ops, addedRootIds) => {
 		explorerViewProvider?.notifyDelta(ops);
-		const { added, needsRebuild } = explorerProvider.applyDelta(ops, addedRootIds);
+		const { added, needsRebuild, hasChildrenCleared } = explorerProvider.applyDelta(ops, addedRootIds);
+		if (hasChildrenCleared.length > 0) {
+			explorerViewProvider?.notifyHasChildrenCleared(hasChildrenCleared);
+		}
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
 		if (needsRebuild) {
 			rebuildQuickPickCache();
@@ -139,10 +140,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		cachedSearchStrings = [];
 		explorerViewProvider?.resetFullSyncStatus();
 		explorerViewProvider?.notifySnapshotReplaced();
-	}, (_query, nodes) => {
+	}, (query, nodes) => {
+		if (explorerViewProvider?.getFullSyncStatus() !== "too_big") {
+			return;
+		}
 		const added = explorerProvider.mergeSearchResults(nodes);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
 		appendQuickPickCache(added);
+		explorerViewProvider?.handleSearchResults(query, nodes);
 	}, () => {
 		explorerViewProvider?.markFullSyncTooBig();
 	});
@@ -918,14 +923,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 	}
 
 	function dottedPath(node: Node, cache: Map<string, string>): string {
-		const cached = cache.get(node.id);
-		if (cached !== undefined) {
-			return cached;
-		}
-		const parent = node.parentId ? explorerProvider.getNodeById(node.parentId) : undefined;
-		const path = parent ? dottedPath(parent, cache) + '.' + node.name : node.name;
-		cache.set(node.id, path);
-		return path;
+		return buildDottedPath(node, (id) => explorerProvider.getNodeById(id), cache);
 	}
 
 	async function waitForScriptInSourcemap(node: Node, timeoutMs: number = 2000): Promise<boolean> {

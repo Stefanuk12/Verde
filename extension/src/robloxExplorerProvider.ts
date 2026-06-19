@@ -40,6 +40,15 @@ export class RobloxExplorerProvider {
 		return listIsComplete || hasChildren !== true;
 	}
 
+	private reconcileParentHasChildren(parentId: string | null, cleared: Set<string>): void {
+		if (parentId === null) return;
+		const parent = this.nodesById.get(parentId);
+		if (parent && parent.hasChildren === true && parent.childrenLoaded && parent.children.length === 0) {
+			parent.hasChildren = false;
+			cleared.add(parentId);
+		}
+	}
+
 	public onChange(callback: (wasReset: boolean) => void): () => void {
 		this.onChangeCallbacks.push(callback);
 		return () => {
@@ -73,31 +82,52 @@ export class RobloxExplorerProvider {
 			return Array.from(this.nodesById.values());
 		}
 		const result: Node[] = [];
+		const memo = new Map<string, boolean>();
 		for (const node of this.nodesById.values()) {
-			if (this.isReachable(node)) {
+			if (this.isReachable(node, memo)) {
 				result.push(node);
 			}
 		}
 		return result;
 	}
 
-	private isReachable(node: Node): boolean {
-		let current: Node | undefined = node;
+	private isReachable(node: Node, memo?: Map<string, boolean>): boolean {
+		const cached = memo?.get(node.id);
+		if (cached !== undefined) {
+			return cached;
+		}
+		const chain: string[] = [];
 		const guard = new Set<string>();
+		let current: Node | undefined = node;
+		let reachable = false;
 		while (current) {
+			const hit = memo?.get(current.id);
+			if (hit !== undefined) {
+				reachable = hit;
+				break;
+			}
+			chain.push(current.id);
 			if (this.detachedIds.has(current.id)) {
-				return false;
+				reachable = false;
+				break;
 			}
 			if (current.parentId === null) {
-				return this.rootIds.includes(current.id);
+				reachable = this.rootIds.includes(current.id);
+				break;
 			}
 			if (guard.has(current.id)) {
-				return false;
+				reachable = false;
+				break;
 			}
 			guard.add(current.id);
 			current = this.nodesById.get(current.parentId);
 		}
-		return false;
+		if (memo) {
+			for (const id of chain) {
+				memo.set(id, reachable);
+			}
+		}
+		return reachable;
 	}
 
 	public markSubtreeUnloaded(ids: string[]): string[] {
@@ -213,6 +243,9 @@ export class RobloxExplorerProvider {
 					existing.parentId = n.parentId;
 					existing.hasChildren = n.hasChildren;
 					if (n.hasChildren === true) existing.childrenLoaded = false;
+				} else if (n.hasChildren === true && existing.hasChildren !== true) {
+					existing.hasChildren = true;
+					existing.childrenLoaded = false;
 				}
 				continue;
 			}
@@ -251,13 +284,14 @@ export class RobloxExplorerProvider {
 			.filter((n): n is Node => n !== undefined);
 	}
 
-	public applyDelta(ops: ExplorerDeltaOp[], addedRootIds?: string[]): { added: Node[]; needsRebuild: boolean } {
+	public applyDelta(ops: ExplorerDeltaOp[], addedRootIds?: string[]): { added: Node[]; needsRebuild: boolean; hasChildrenCleared: string[] } {
 		if (this.nodesById.size === 0) {
-			return { added: [], needsRebuild: false };
+			return { added: [], needsRebuild: false, hasChildrenCleared: [] };
 		}
 
 		const addedIds: string[] = [];
 		let needsRebuild = false;
+		const hasChildrenCleared = new Set<string>();
 
 		const sorted = [...ops].sort((a, b) => {
 			const t = (a.timestamp ?? 0) - (b.timestamp ?? 0);
@@ -275,6 +309,7 @@ export class RobloxExplorerProvider {
 							const i = parent.children.indexOf(op.id);
 							if (i >= 0) parent.children.splice(i, 1);
 						}
+						this.reconcileParentHasChildren(node.parentId, hasChildrenCleared);
 					} else {
 						const i = this.rootIds.indexOf(op.id);
 						if (i >= 0) this.rootIds.splice(i, 1);
@@ -293,10 +328,12 @@ export class RobloxExplorerProvider {
 					if (op.disabled !== undefined) node.disabled = op.disabled;
 					if (op.runContext !== undefined) node.runContext = op.runContext;
 					if (op.hasChildren !== undefined) {
-						node.hasChildren = op.hasChildren;
-						if (op.hasChildren && node.children.length === 0) {
-							node.childrenLoaded = false;
-						} else if (!op.hasChildren) {
+						if (op.hasChildren) {
+							node.hasChildren = true;
+							if (node.children.length === 0) node.childrenLoaded = false;
+						} else if (node.children.length === 0) {
+							if (node.hasChildren === true) hasChildrenCleared.add(op.id);
+							node.hasChildren = false;
 							node.childrenLoaded = true;
 						}
 					}
@@ -307,6 +344,7 @@ export class RobloxExplorerProvider {
 					if (!node) break;
 					needsRebuild = true;
 					const newParentId = op.newParentId ?? null;
+					const oldParentId = node.parentId;
 					if (node.parentId) {
 						const oldParent = this.nodesById.get(node.parentId);
 						if (oldParent) {
@@ -317,6 +355,7 @@ export class RobloxExplorerProvider {
 						const i = this.rootIds.indexOf(op.id);
 						if (i >= 0) this.rootIds.splice(i, 1);
 					}
+					this.reconcileParentHasChildren(oldParentId, hasChildrenCleared);
 					if (newParentId !== null) {
 						const newParent = this.nodesById.get(newParentId);
 						if (!newParent) {
@@ -334,7 +373,7 @@ export class RobloxExplorerProvider {
 						}
 					} else {
 						node.parentId = null;
-						this.rootIds.push(op.id);
+						if (!this.rootIds.includes(op.id)) this.rootIds.push(op.id);
 						this.detachedIds.delete(op.id);
 					}
 					break;
@@ -406,6 +445,10 @@ export class RobloxExplorerProvider {
 			: addedIds
 				.map(id => this.nodesById.get(id))
 				.filter((n): n is Node => n !== undefined);
-		return { added, needsRebuild };
+		const stillCleared = Array.from(hasChildrenCleared).filter(id => {
+			const node = this.nodesById.get(id);
+			return node !== undefined && node.hasChildren !== true;
+		});
+		return { added, needsRebuild, hasChildrenCleared: stillCleared };
 	}
 }

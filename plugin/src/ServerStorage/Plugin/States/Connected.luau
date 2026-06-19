@@ -156,6 +156,15 @@ local function _pushOp(client: Client, op: any)
 	end)
 end
 
+local function _pushHasChildren(client: Client, id: string, hasChildren: boolean)
+	_pushOp(client, {
+		type = "update_node",
+		timestamp = tick(),
+		id = id,
+		hasChildren = hasChildren,
+	})
+end
+
 local function _listenToChanges(client: Client, descendant: Instance)
 	local id = descendant:GetDebugId(0)
 
@@ -206,24 +215,38 @@ local function _listenToChanges(client: Client, descendant: Instance)
 
 	_trackInstance(
 		id,
-		descendant.ChildAdded:Connect(function()
+		descendant.ChildAdded:Connect(function(child)
+			local function flagHasChildren()
+				_pushHasChildren(client, id, true)
+			end
+
+			if not loadedParents[id] then
+				flagHasChildren()
+				return
+			end
+
+			local childId = child:GetDebugId(0)
+			if instanceConnections[childId] or not isValidInstance(child) then
+				flagHasChildren()
+				return
+			end
+
+			local node = SerializeDatamodel.serializeShallow(child, id)
+			InstanceMap[node.id] = child
+			_listenToChanges(client, child)
 			_pushOp(client, {
-				type = "update_node",
+				type = "add_subtree",
 				timestamp = tick(),
-				id = id,
-				hasChildren = true,
+				parentId = id,
+				rootId = node.id,
+				nodes = { node },
 			})
 		end)
 	)
 	_trackInstance(
 		id,
 		descendant.ChildRemoved:Connect(function()
-			_pushOp(client, {
-				type = "update_node",
-				timestamp = tick(),
-				id = id,
-				hasChildren = #descendant:GetChildren() > 0,
-			})
+			_pushHasChildren(client, id, #descendant:GetChildren() > 0)
 		end)
 	)
 end
@@ -255,6 +278,7 @@ local function _sendSnapshot(client: Client, full: boolean?)
 	if full then
 		snapshot, instanceMap = SerializeDatamodel.serializeFull(MAX_FULL_SYNC_NODES)
 		if not snapshot or not instanceMap then
+			fullSyncMode = false
 			_sendSnapshotTooBig(client)
 			return
 		end
@@ -305,7 +329,14 @@ local function _sendSnapshot(client: Client, full: boolean?)
 		payload = snapshot,
 		isFull = full == true,
 	}) then
-		warn("[verde] failed to send explorer_snapshot")
+		warn("[verde] failed to send explorer_snapshot (will retry)")
+		if not snapshotPromise then
+			snapshotPromise = Promise.delay(0.1):andThen(function()
+				snapshotPromise = nil
+				_sendSnapshot(client, full)
+			end)
+		end
+		return
 	end
 
 	lastAckTime = tick()
@@ -671,6 +702,7 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 			InstanceMap[instanceId] = nil
 			_disconnectInstance(instanceId)
 			loadedParents[instanceId] = nil
+			searchGraftedIds[instanceId] = nil
 
 			_pushOp(client, {
 				type = "remove_node",
