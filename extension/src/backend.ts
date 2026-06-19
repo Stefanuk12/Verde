@@ -194,9 +194,6 @@ export class VerdeBackend {
             this.initialSyncComplete = false;
 
             this.send(socket, { type: "ack" });
-            // The plugin auto-sends a roots snapshot when it enters its Connected
-            // state, so we don't request one here — doing so would make the plugin
-            // serialize and the extension reset its tree twice on every connect.
             this.startAckInterval();
         });
 
