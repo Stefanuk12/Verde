@@ -7,16 +7,15 @@
 
 local RunService = game:GetService("RunService")
 
-local Verde = script.Parent
-
 if RunService:IsRunning() then
 	return
 end
 
 local StateController = require(script.Parent.States.StateController)
-local PluginButtonFactory = require(Verde.Shared.PluginButton)
-local ButtonInstance = require(Verde.Shared.ButtonInstance)
-local SoundPlayer = require(Verde.Shared.SoundPlayer)
+local SharedFolder = require(script.Parent.Shared)
+local PluginButtonFactory = SharedFolder.PluginButton
+local ButtonInstance = SharedFolder.ButtonInstance
+local SoundPlayer = SharedFolder.SoundPlayer
 
 SoundPlayer.Init(plugin)
 

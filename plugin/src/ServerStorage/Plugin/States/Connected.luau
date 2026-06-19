@@ -7,10 +7,11 @@ local isValidInstance = require(script.Parent.Parent.Utils.isValidInstance)
 local WebSocketClient = require(script.Parent.Parent.WebSocketClient)
 local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
 local Promise = require(script.Parent.Parent.Packages.Promise)
-local PropertyTracker = require(SharedFolder.PropertyTracker)
-local ButtonInstance = require(SharedFolder.ButtonInstance)
-local Icons = require(SharedFolder.Icons)
-local State = require(SharedFolder.State)
+local PropertyTracker = SharedFolder.PropertyTracker
+local ButtonInstance = SharedFolder.ButtonInstance
+local Icons = SharedFolder.Icons
+local State = SharedFolder.State
+local Operations = require(script.Parent.Parent.Operations)
 
 type Client = WebSocketClient.WebSocketClientInstance
 
@@ -20,7 +21,6 @@ local PROPERTIES_TO_WATCH = {
 
 local MAX_FULL_SYNC_NODES = 50000
 
-local operations: { [string]: (...any) -> boolean } = {}
 local connections: { RBXScriptConnection } = {}
 local instanceConnections: { [string]: { RBXScriptConnection } } = {}
 local snapshotPromise: any = nil
@@ -68,11 +68,6 @@ local function _trackInstance(id: string, conn: RBXScriptConnection)
 	table.insert(list, conn)
 end
 
-for _, operationMod in script.Parent.Parent.Operations:GetChildren() do
-	local operation = require(operationMod)
-	operations[operationMod.Name] = operation
-end
-
 local function _parentDebugId(instance: Instance): string?
 	local parent = instance.Parent
 	if parent and parent ~= game then
@@ -103,10 +98,9 @@ local function _flushDelta(client: Client)
 		return
 	end
 
-	local addedRootIds: { string }? = nil
+	local addedRootIds: { string } = {}
 	for _, op in pendingOps do
 		if op.type == "add_subtree" and op.addedRootId then
-			addedRootIds = addedRootIds or {}
 			table.insert(addedRootIds, op.addedRootId)
 		end
 	end
@@ -115,7 +109,7 @@ local function _flushDelta(client: Client)
 		type = "explorer_delta",
 		ops = pendingOps,
 	}
-	if addedRootIds then
+	if #addedRootIds > 0 then
 		message.addedRootIds = addedRootIds
 	end
 
@@ -382,7 +376,7 @@ local function _sendOperationResult(
 end
 
 local propertyUpdatePromise: any = nil
-local getProperties = require(script.Parent.Parent.Operations.get_properties)
+local getProperties = Operations.get_properties
 
 local function _sendPropertyUpdate(client: Client, nodeId: string)
 	if not client or not client.connected then
@@ -415,7 +409,7 @@ local function _handleOperation(client: Client, operationId: string, operation: 
 		return
 	end
 
-	local operationFunction = operations[operation.type]
+	local operationFunction = Operations[operation.type]
 
 	if operationFunction then
 		local result, errorMsg = operationFunction(operation)

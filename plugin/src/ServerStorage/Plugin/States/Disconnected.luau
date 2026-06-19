@@ -1,8 +1,7 @@
-local SharedFolder = script.Parent.Parent.Shared
-
-local ButtonInstance = require(SharedFolder.ButtonInstance)
-local Icons = require(SharedFolder.Icons)
-local State = require(SharedFolder.State)
+local SharedFolder = require(script.Parent.Parent.Shared)
+local ButtonInstance = SharedFolder.ButtonInstance
+local Icons = SharedFolder.Icons
+local State = SharedFolder.State
 
 local disconnected = State.new()
 
