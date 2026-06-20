@@ -42,7 +42,7 @@ function StateController.GetState(): string?
 	return stateName
 end
 
-RunService.Heartbeat:Connect(function(dt)
+local _heartbeatConnection: RBXScriptConnection? = RunService.Heartbeat:Connect(function(dt)
 	if RunService:IsRunning() then
 		return
 	end
@@ -53,5 +53,12 @@ RunService.Heartbeat:Connect(function(dt)
 
 	_currentState.onUpdate(dt, _transitionTo)
 end)
+
+function StateController.Cleanup()
+	if _heartbeatConnection then
+		_heartbeatConnection:Disconnect()
+		_heartbeatConnection = nil
+	end
+end
 
 return StateController

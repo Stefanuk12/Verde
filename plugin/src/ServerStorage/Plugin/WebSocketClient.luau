@@ -23,6 +23,7 @@ export type WebSocketClientInstance = {
 	messageHandlers: { [string]: (any) -> () },
 	config: configType,
 	onClosed: BindableEvent,
+	messageConnection: RBXScriptConnection?,
 
 	connect: (self: WebSocketClientInstance) -> boolean,
 	on: (self: WebSocketClientInstance, event: string, handler: (any) -> ()) -> (),
@@ -47,6 +48,7 @@ function WebSocketClient.new(url, config: configType?)
 	self.client = nil
 	self.connected = false
 	self.messageHandlers = {}
+	self.messageConnection = nil
 	self.onClosed = Instance.new("BindableEvent")
 	self.config = config or {
 		debugMode = false,
@@ -107,7 +109,7 @@ function WebSocketClient:connect()
 	self.connected = true
 
 	-- Set up message handler (only MessageReceived is documented)
-	self.client.MessageReceived:Connect(function(message)
+	self.messageConnection = self.client.MessageReceived:Connect(function(message)
 		local parseSuccess, parseError = pcall(function()
 			self:handleMessage(message)
 		end)
@@ -167,6 +169,11 @@ end
 
 function WebSocketClient:disconnect()
 	self = self :: WebSocketClientInstance
+
+	if self.messageConnection then
+		self.messageConnection:Disconnect()
+		self.messageConnection = nil
+	end
 
 	if not self.client then
 		self.connected = false

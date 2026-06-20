@@ -22,7 +22,7 @@ SoundPlayer.Init(plugin)
 local connectButton = PluginButtonFactory(plugin)
 ButtonInstance.button = connectButton
 
-connectButton.Click:Connect(function()
+local clickConnection = connectButton.Click:Connect(function()
 	local currentStateName = StateController.GetState()
 
 	if not currentStateName or currentStateName == "Connected" or currentStateName == "Connecting" then
@@ -34,6 +34,8 @@ end)
 
 plugin.Unloading:Connect(function()
 	StateController.SwitchState("Disconnected")
+	StateController.Cleanup()
+	clickConnection:Disconnect()
 	SoundPlayer.cleanup()
 end)
 
