@@ -1,13 +1,8 @@
 local Services = require(script.Parent.Parent.Shared.Services)
 
-local serviceInstances = {}
-
-for _, serviceName in Services do
-	serviceInstances[serviceName] = game:GetService(serviceName)
-end
-
 return function(instance: Instance): boolean
-	for _, service in serviceInstances do
+	for _, serviceName in Services do
+		local service = game:GetService(serviceName)
 		if instance:IsDescendantOf(service) then
 			return true
 		end
