@@ -323,11 +323,13 @@ local function _sendSnapshot(client: Client, full: boolean?)
 		_listenToChanges(client, instance)
 	end
 
-	if not _encodeAndSend(client, {
-		type = "explorer_snapshot",
-		payload = snapshot,
-		isFull = full == true,
-	}) then
+	if
+		not _encodeAndSend(client, {
+			type = "explorer_snapshot",
+			payload = snapshot,
+			isFull = full == true,
+		})
+	then
 		warn("[verde] failed to send explorer_snapshot (will retry)")
 		if not snapshotPromise then
 			snapshotPromise = Promise.delay(0.1):andThen(function()
@@ -492,7 +494,8 @@ local function _handleRequestSearch(client: Client, query: string?)
 	local lowercase = string.lower(trimmed)
 
 	local candidates: { Instance }? = nil
-	if lastSearchLower ~= ""
+	if
+		lastSearchLower ~= ""
 		and not lastSearchTruncated
 		and not searchCacheDirty
 		and #lowercase >= #lastSearchLower
@@ -577,11 +580,11 @@ local function _handleReleaseSubtree(parentIds: { string }, nodeIds: { string })
 		return
 	end
 
-	local releasedParents: { [string]: true } = {}
+	local released: { [string]: true } = {}
 	if parentIds then
 		for _, parentId in parentIds do
 			loadedParents[parentId] = nil
-			releasedParents[parentId] = true
+			released[parentId] = true
 		end
 	end
 
@@ -590,14 +593,27 @@ local function _handleReleaseSubtree(parentIds: { string }, nodeIds: { string })
 			_disconnectInstance(id)
 			loadedParents[id] = nil
 			searchGraftedIds[id] = nil
+			released[id] = true
 		end
 	end
 
-	if next(releasedParents) ~= nil and #pendingOps > 0 then
+	if next(released) ~= nil and #pendingOps > 0 then
 		local kept: { any } = {}
 		for _, op in pendingOps do
-			if op.type == "add_subtree" and op.parentId ~= nil and releasedParents[op.parentId] then
-				continue
+			if op.type == "add_subtree" then
+				local drop = (op.parentId ~= nil and released[op.parentId] == true)
+					or (op.rootId ~= nil and released[op.rootId] == true)
+				if not drop and op.nodes then
+					for _, node in op.nodes do
+						if node.id ~= nil and released[node.id] == true then
+							drop = true
+							break
+						end
+					end
+				end
+				if drop then
+					continue
+				end
 			end
 			table.insert(kept, op)
 		end
