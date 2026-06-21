@@ -301,6 +301,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 			};
 
 			const handleFullSnapshotUnavailable = () => {
+				if (explorerViewProvider.getFullSyncStatus() !== 'too_big') return;
 				fullSyncUnavailable = true;
 				if (backend && lastRawQuery.length >= 2) {
 					sendServerSearch(lastRawQuery);

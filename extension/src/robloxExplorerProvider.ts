@@ -40,6 +40,19 @@ export class RobloxExplorerProvider {
 		return listIsComplete || hasChildren !== true;
 	}
 
+	private removeFromParent(node: Node): void {
+		if (node.parentId !== null) {
+			const oldParent = this.nodesById.get(node.parentId);
+			if (oldParent) {
+				const i = oldParent.children.indexOf(node.id);
+				if (i >= 0) oldParent.children.splice(i, 1);
+			}
+		} else {
+			const i = this.rootIds.indexOf(node.id);
+			if (i >= 0) this.rootIds.splice(i, 1);
+		}
+	}
+
 	private reconcileParentHasChildren(parentId: string | null, cleared: Set<string>): void {
 		if (parentId === null) return;
 		const parent = this.nodesById.get(parentId);
@@ -250,19 +263,40 @@ export class RobloxExplorerProvider {
 
 		const addedIds: string[] = [];
 		const linkIds: string[] = [];
+		const cleared = new Set<string>();
 		let needsRebuild = false;
 		for (const n of nodes) {
 			const existing = this.nodesById.get(n.id);
 			if (existing) {
 				if (this.refreshNodeFields(existing, n)) needsRebuild = true;
-				if (this.detachedIds.has(n.id)) {
-					linkIds.push(n.id);
+
+				const wasDetached = this.detachedIds.has(n.id);
+				if (wasDetached || n.parentId !== existing.parentId) {
+					if (!wasDetached) {
+						const oldParentId = existing.parentId;
+						this.removeFromParent(existing);
+						this.reconcileParentHasChildren(oldParentId, cleared);
+						needsRebuild = true;
+					}
 					existing.parentId = n.parentId;
-					existing.hasChildren = n.hasChildren;
-					if (n.hasChildren === true) existing.childrenLoaded = false;
-				} else if (n.hasChildren === true && existing.hasChildren !== true) {
-					existing.hasChildren = true;
-					existing.childrenLoaded = false;
+					this.detachedIds.add(n.id);
+					linkIds.push(n.id);
+				}
+
+				if (n.hasChildren === true) {
+					if (existing.hasChildren !== true) {
+						existing.hasChildren = true;
+						existing.childrenLoaded = false;
+						needsRebuild = true;
+					}
+				} else if (existing.hasChildren === true || existing.children.length > 0) {
+					for (const childId of [...existing.children]) {
+						this.deleteNodeAndDescendants(childId);
+					}
+					existing.children = [];
+					existing.hasChildren = false;
+					existing.childrenLoaded = true;
+					needsRebuild = true;
 				}
 				continue;
 			}
@@ -283,7 +317,7 @@ export class RobloxExplorerProvider {
 				if (parent && !parent.children.includes(node.id)) {
 					parent.children.push(node.id);
 					if (parent.hasChildren !== true) parent.hasChildren = true;
-					parent.childrenLoaded = false;
+					if (parent.childrenLoaded !== true) parent.childrenLoaded = false;
 				}
 				if (parent && !this.detachedIds.has(parent.id)) {
 					this.detachedIds.delete(id);

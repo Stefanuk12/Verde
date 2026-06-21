@@ -40,21 +40,23 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     private readonly contextMenuRegistry: ContextMenuRegistry,
   ) {}
 
-  public markFullSyncSucceeded(): void {
-    this.fullSyncStatus = "full";
+  private setSyncStatus(status: FullSyncStatus): void {
+    this.fullSyncStatus = status;
     this.pushSyncStatus();
+  }
+
+  public markFullSyncSucceeded(): void {
+    this.setSyncStatus("full");
     this.resolvePendingSearch();
   }
 
   public markFullSyncTooBig(): void {
-    this.fullSyncStatus = "too_big";
-    this.pushSyncStatus();
+    this.setSyncStatus("too_big");
     this.resolvePendingSearch();
   }
 
   public resetFullSyncStatus(): void {
-    this.fullSyncStatus = "unknown";
-    this.pushSyncStatus();
+    this.setSyncStatus("unknown");
   }
 
   public getFullSyncStatus(): FullSyncStatus {
@@ -63,8 +65,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
   public markPartialSnapshot(): void {
     if (this.fullSyncStatus === "full") {
-      this.fullSyncStatus = "unknown";
-      this.pushSyncStatus();
+      this.setSyncStatus("unknown");
     }
     this.tryResumePendingSearch();
   }

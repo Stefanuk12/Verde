@@ -495,7 +495,8 @@ local function _handleRequestSearch(client: Client, query: string?)
 
 	local candidates: { Instance }? = nil
 	if
-		lastSearchLower ~= ""
+		fullSyncMode
+		and lastSearchLower ~= ""
 		and not lastSearchTruncated
 		and not searchCacheDirty
 		and #lowercase >= #lastSearchLower
@@ -503,6 +504,8 @@ local function _handleRequestSearch(client: Client, query: string?)
 	then
 		candidates = lastSearchMatched
 	end
+
+	searchCacheDirty = false
 
 	local nodes, resultInstanceMap, truncated, matched =
 		SerializeDatamodel.serializeSearchResults(lowercase, candidates)
@@ -514,7 +517,6 @@ local function _handleRequestSearch(client: Client, query: string?)
 	lastSearchLower = lowercase
 	lastSearchMatched = matched
 	lastSearchTruncated = truncated
-	searchCacheDirty = false
 
 	_releaseSearchGrafted(resultInstanceMap)
 	for id, instance in resultInstanceMap do
@@ -556,12 +558,7 @@ local function _handleRequestChildren(client: Client, parentIds: { string })
 		loadedParents[parentId] = true
 
 		if #children == 0 then
-			_pushOp(client, {
-				type = "update_node",
-				timestamp = tick(),
-				id = parentId,
-				hasChildren = false,
-			})
+			_pushHasChildren(client, parentId, false)
 			continue
 		end
 
@@ -682,12 +679,7 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 			if not _shouldSyncNewDescendant(descendant) then
 				local parentId = _parentDebugId(descendant)
 				if parentId and InstanceMap[parentId] then
-					_pushOp(client, {
-						type = "update_node",
-						timestamp = tick(),
-						id = parentId,
-						hasChildren = true,
-					})
+					_pushHasChildren(client, parentId, true)
 				end
 				return
 			end
