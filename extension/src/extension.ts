@@ -75,7 +75,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 			return;
 		}
 		backend.requestSnapshot(true).then(finishReveal).catch(() => {
-			trySearchFallback();
+			if (!trySearchFallback() && onMissing) onMissing();
 		});
 	};
 

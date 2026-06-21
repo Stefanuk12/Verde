@@ -114,6 +114,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     if (this.fullSyncStatus === "too_big") {
       this.pendingSearchQuery = null;
       if (query.length < 2) {
+        this.backend.requestSearch("");
         this.postSearchResults(query, []);
         return;
       }
@@ -820,6 +821,7 @@ searchEl.addEventListener('input',function(){
     searchFilter='';renderTree();return;
   }
   searchDebounce=setTimeout(function(){
+    if(raw!==searchFilter)searchResultIds=null;
     sendSearchQuery(raw);
     searchFilter=raw;renderTree();
   },50);
