@@ -144,9 +144,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		if (explorerViewProvider?.getFullSyncStatus() !== "too_big") {
 			return;
 		}
-		const added = explorerProvider.mergeSearchResults(nodes);
+		const { added, needsRebuild } = explorerProvider.mergeSearchResults(nodes);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
-		appendQuickPickCache(added);
+		if (needsRebuild) {
+			rebuildQuickPickCache();
+		} else {
+			appendQuickPickCache(added);
+		}
 		explorerViewProvider?.handleSearchResults(query, nodes);
 	}, () => {
 		explorerViewProvider?.markFullSyncTooBig();
@@ -289,6 +293,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				serverSearchActive = true;
 			};
 
+			const clearServerSearch = () => {
+				if (serverSearchActive && backend) {
+					backend.requestSearch('');
+					serverSearchActive = false;
+				}
+			};
+
 			const handleFullSnapshotUnavailable = () => {
 				fullSyncUnavailable = true;
 				if (backend && lastRawQuery.length >= 2) {
@@ -330,6 +341,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				const query = rawQuery.replace(/\s+/g, '.');
 				if (!query) {
 					lastRawQuery = '';
+					clearServerSearch();
 					quickPick.items = [];
 					quickPick.busy = false;
 					return;
@@ -337,8 +349,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				quickPick.busy = true;
 				lastRawQuery = rawQuery;
 				debounceTimer = setTimeout(() => {
-					if (fullSyncUnavailable && backend && rawQuery.length >= 2) {
-						sendServerSearch(rawQuery);
+					if (fullSyncUnavailable && backend) {
+						if (rawQuery.length >= 2) sendServerSearch(rawQuery);
+						else clearServerSearch();
 					}
 					filterItems(query);
 				}, 50);
@@ -379,10 +392,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				if (onQuickPickCacheRebuilt === cacheRebuiltListener) {
 					onQuickPickCacheRebuilt = null;
 				}
-				if (serverSearchActive && backend) {
-					backend.requestSearch('');
-					serverSearchActive = false;
-				}
+				clearServerSearch();
 				quickPick.dispose();
 			});
 			quickPick.show();

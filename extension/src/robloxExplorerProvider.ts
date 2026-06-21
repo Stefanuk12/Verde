@@ -230,14 +230,31 @@ export class RobloxExplorerProvider {
 		this.fireChange(true);
 	}
 
-	public mergeSearchResults(nodes: Node[]): Node[] {
-		if (nodes.length === 0) return [];
+	private refreshNodeFields(node: Node, incoming: Node): boolean {
+		let changed = false;
+		if (incoming.name !== node.name) { node.name = incoming.name; changed = true; }
+		if (incoming.className !== node.className) { node.className = incoming.className; changed = true; }
+		if (incoming.disabled !== undefined && incoming.disabled !== node.disabled) {
+			node.disabled = incoming.disabled;
+			changed = true;
+		}
+		if (incoming.runContext !== undefined && incoming.runContext !== node.runContext) {
+			node.runContext = incoming.runContext;
+			changed = true;
+		}
+		return changed;
+	}
+
+	public mergeSearchResults(nodes: Node[]): { added: Node[]; needsRebuild: boolean } {
+		if (nodes.length === 0) return { added: [], needsRebuild: false };
 
 		const addedIds: string[] = [];
 		const linkIds: string[] = [];
+		let needsRebuild = false;
 		for (const n of nodes) {
 			const existing = this.nodesById.get(n.id);
 			if (existing) {
+				if (this.refreshNodeFields(existing, n)) needsRebuild = true;
 				if (this.detachedIds.has(n.id)) {
 					linkIds.push(n.id);
 					existing.parentId = n.parentId;
@@ -279,9 +296,10 @@ export class RobloxExplorerProvider {
 
 		this.fireChange();
 
-		return addedIds
+		const added = addedIds
 			.map(id => this.nodesById.get(id))
 			.filter((n): n is Node => n !== undefined);
+		return { added, needsRebuild };
 	}
 
 	public applyDelta(ops: ExplorerDeltaOp[], addedRootIds?: string[]): { added: Node[]; needsRebuild: boolean; hasChildrenCleared: string[] } {

@@ -677,8 +677,16 @@ function releaseSubtree(id){
   var n=nodes[id];
   if(!n||n.childrenLoaded!==true)return;
   if(childrenByParent[id]===undefined&&!pendingChildren[id])return;
-  delete childrenByParent[id];
-  delete pendingChildren[id];
+  var stack=[id];
+  while(stack.length){
+    var pid=stack.pop();
+    var kids=childrenByParent[pid];
+    if(kids){for(var i=0;i<kids.length;i++)stack.push(kids[i])}
+    if(pid!==id)expandedIds.delete(pid);
+    delete childrenByParent[pid];
+    delete pendingChildren[pid];
+  }
+  saveExp();
   vscode.postMessage({type:'releaseSubtree',parentIds:[id]});
 }
 

@@ -35,6 +35,8 @@ local searchGraftedIds: { [string]: true } = {}
 local lastSearchLower = ""
 local lastSearchMatched: { Instance } = {}
 local lastSearchTruncated = false
+local searchCacheDirty = false
+local searchGeneration = 0
 
 local lastAckTime = 0
 local initialSyncComplete = false
@@ -43,6 +45,7 @@ local function _resetSearchCache()
 	lastSearchLower = ""
 	lastSearchMatched = {}
 	lastSearchTruncated = false
+	searchCacheDirty = false
 end
 
 local function _disconnectInstance(id: string)
@@ -166,6 +169,7 @@ local function _listenToChanges(client: Client, descendant: Instance)
 		_trackInstance(
 			id,
 			descendant:GetPropertyChangedSignal(property):Connect(function()
+				searchCacheDirty = true
 				_pushOp(client, {
 					type = "update_node",
 					timestamp = tick(),
@@ -197,6 +201,7 @@ local function _listenToChanges(client: Client, descendant: Instance)
 	_trackInstance(
 		id,
 		descendant.AncestryChanged:Connect(function()
+			searchCacheDirty = true
 			local newParentId = _parentDebugId(descendant)
 			_pushOp(client, {
 				type = "move_node",
@@ -474,6 +479,9 @@ local function _handleRequestSearch(client: Client, query: string?)
 		return
 	end
 
+	searchGeneration += 1
+	local generation = searchGeneration
+
 	local trimmed = query and string.gsub(query, "^%s*(.-)%s*$", "%1") or ""
 	if #trimmed < 2 then
 		_releaseSearchGrafted(nil)
@@ -486,6 +494,7 @@ local function _handleRequestSearch(client: Client, query: string?)
 	local candidates: { Instance }? = nil
 	if lastSearchLower ~= ""
 		and not lastSearchTruncated
+		and not searchCacheDirty
 		and #lowercase >= #lastSearchLower
 		and string.sub(lowercase, 1, #lastSearchLower) == lastSearchLower
 	then
@@ -495,9 +504,14 @@ local function _handleRequestSearch(client: Client, query: string?)
 	local nodes, resultInstanceMap, truncated, matched =
 		SerializeDatamodel.serializeSearchResults(lowercase, candidates)
 
+	if generation ~= searchGeneration then
+		return
+	end
+
 	lastSearchLower = lowercase
 	lastSearchMatched = matched
 	lastSearchTruncated = truncated
+	searchCacheDirty = false
 
 	_releaseSearchGrafted(resultInstanceMap)
 	for id, instance in resultInstanceMap do
@@ -647,6 +661,8 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 				return
 			end
 
+			searchCacheDirty = true
+
 			if not _shouldSyncNewDescendant(descendant) then
 				local parentId = _parentDebugId(descendant)
 				if parentId and InstanceMap[parentId] then
@@ -692,6 +708,8 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 			if not InstanceMap[instanceId] then
 				return
 			end
+
+			searchCacheDirty = true
 
 			InstanceMap[instanceId] = nil
 			_disconnectInstance(instanceId)
