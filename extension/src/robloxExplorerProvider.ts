@@ -387,7 +387,7 @@ export class RobloxExplorerProvider {
 							needsRebuild = true;
 						}
 						const incomingChildren = [...(n.children ?? [])];
-						const keepExisting = existing !== undefined && incomingChildren.length === 0 && existing.children.length > 0;
+						const keepExisting = existing !== undefined && incomingChildren.length === 0 && existing.children.length > 0 && existing.childrenLoaded === true && n.hasChildren === true;
 						this.nodesById.set(n.id, {
 							...n,
 							children: keepExisting ? existing.children : incomingChildren,

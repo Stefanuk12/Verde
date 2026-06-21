@@ -281,11 +281,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 			let debounceTimer: NodeJS.Timeout | undefined;
 			let lastRawQuery = '';
+			let serverSearchActive = false;
+
+			const sendServerSearch = (query: string) => {
+				if (!backend) return;
+				backend.requestSearch(query);
+				serverSearchActive = true;
+			};
 
 			const handleFullSnapshotUnavailable = () => {
 				fullSyncUnavailable = true;
 				if (backend && lastRawQuery.length >= 2) {
-					backend.requestSearch(lastRawQuery);
+					sendServerSearch(lastRawQuery);
 				}
 			};
 
@@ -331,7 +338,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				lastRawQuery = rawQuery;
 				debounceTimer = setTimeout(() => {
 					if (fullSyncUnavailable && backend && rawQuery.length >= 2) {
-						backend.requestSearch(rawQuery);
+						sendServerSearch(rawQuery);
 					}
 					filterItems(query);
 				}, 50);
@@ -371,6 +378,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 			quickPick.onDidHide(() => {
 				if (onQuickPickCacheRebuilt === cacheRebuiltListener) {
 					onQuickPickCacheRebuilt = null;
+				}
+				if (serverSearchActive && backend) {
+					backend.requestSearch('');
+					serverSearchActive = false;
 				}
 				quickPick.dispose();
 			});
