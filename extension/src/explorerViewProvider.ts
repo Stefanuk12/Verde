@@ -63,6 +63,14 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     return this.fullSyncStatus;
   }
 
+  public reissueServerSearch(): boolean {
+    if (this.fullSyncStatus === "too_big" && this.currentSearchQuery.length >= 2) {
+      this.backend.requestSearch(this.currentSearchQuery);
+      return true;
+    }
+    return false;
+  }
+
   public markPartialSnapshot(): void {
     if (this.fullSyncStatus === "full") {
       this.setSyncStatus("unknown");

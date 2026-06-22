@@ -295,8 +295,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 
 			const clearServerSearch = () => {
 				if (serverSearchActive && backend) {
-					backend.requestSearch('');
 					serverSearchActive = false;
+					if (!explorerViewProvider.reissueServerSearch()) {
+						backend.requestSearch('');
+					}
 				}
 			};
 
