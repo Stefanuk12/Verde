@@ -69,6 +69,11 @@
           "type": "boolean",
           "default": false,
           "description": "When enabled, single-clicking an instance opens it immediately. Scripts open in the editor and other instances open in the Properties panel. When disabled, those actions require a double-click."
+        },
+        "verde.iconDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path or workspace-relative path to a directory of Roblox class icon PNGs. You can point either to the icon folder itself or to a parent pack root that contains RobloxCustom/instance/16x/200. Matching files override bundled icons, and missing files fall back to Verde's built-in icons."
         }
       }
     },

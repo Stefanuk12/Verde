@@ -54,6 +54,7 @@ Verde can be used either with a dedicated sync tool (Like Rojo/Argon/Azul) or wi
 * `verde.port`: Port for the WebSocket server - defaults to 9000
 * `verde.host`: Host IP address for the WebSocket server - defaults to "localhost"
 * `verde.autoStart`: Automatically start the server when the extension activates - defaults to true
+* `verde.iconDirectory`: Optional absolute or workspace-relative directory containing `ClassName.png` overrides. You can point either to the icon folder itself or to a parent pack root that contains `RobloxCustom/instance/16x/200`. Missing icons still use Verde's bundled assets.
 
 ## Usage
 

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as https from "https";
+import { getAvailableIconClassNames } from "./iconResolver";
 
 const COMMON_CLASS_NAMES = [
     "Part",
@@ -315,15 +316,7 @@ function buildList(creatable: string[], iconClassNames: Set<string>): string[] {
 }
 
 async function getIconClassNames(context: vscode.ExtensionContext): Promise<Set<string>> {
-    const assetsUri = vscode.Uri.joinPath(context.extensionUri, "assets");
-    const entries = await vscode.workspace.fs.readDirectory(assetsUri);
-    const names = new Set<string>();
-    for (const [name, type] of entries) {
-        if (type === vscode.FileType.File && name.endsWith(".png")) {
-            names.add(name.slice(0, -".png".length));
-        }
-    }
-    return names;
+    return getAvailableIconClassNames(context.extensionUri);
 }
 
 function fetchCreatableClasses(): Promise<string[]> {
