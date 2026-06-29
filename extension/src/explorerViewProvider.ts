@@ -3,7 +3,7 @@ import { RobloxExplorerProvider, Node } from "./robloxExplorerProvider";
 import { ExplorerDeltaOp } from "./backend";
 import { VerdeBackend } from "./backend";
 import { getClassNames } from "./robloxClasses";
-import { isScriptClass, scriptIconClass } from "./utils";
+import { isScriptClass, scriptIconClass, buildDottedPath } from "./utils";
 import { getThemeCssBlock, getThemeScriptBlock, getThemeStyleAttribute } from "./webviewTheme";
 import { ContextMenuRegistry } from "./contextMenuRegistry";
 
@@ -14,8 +14,13 @@ type WebviewNode = {
   iconClassName: string;
   hasChildren: boolean;
   isScript: boolean;
+  childrenLoaded?: boolean;
   disabled?: boolean;
 };
+
+type FullSyncStatus = "unknown" | "full" | "too_big";
+
+const MAX_LOCAL_SEARCH_RESULTS = 500;
 
 export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "verde.view";
@@ -24,6 +29,9 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   private selectedIds: string[] = [];
   private selectionListeners: ((nodes: Node[]) => void)[] = [];
   private knownParentIds: Set<string> = new Set();
+  private fullSyncStatus: FullSyncStatus = "unknown";
+  private pendingSearchQuery: string | null = null;
+  private currentSearchQuery: string = "";
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -31,6 +39,155 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     private readonly backend: VerdeBackend,
     private readonly contextMenuRegistry: ContextMenuRegistry,
   ) {}
+
+  private setSyncStatus(status: FullSyncStatus): void {
+    this.fullSyncStatus = status;
+    this.pushSyncStatus();
+  }
+
+  public markFullSyncSucceeded(): void {
+    this.setSyncStatus("full");
+    this.resolvePendingSearch();
+  }
+
+  public markFullSyncTooBig(): void {
+    this.setSyncStatus("too_big");
+    this.resolvePendingSearch();
+  }
+
+  public resetFullSyncStatus(): void {
+    this.setSyncStatus("unknown");
+  }
+
+  public getFullSyncStatus(): FullSyncStatus {
+    return this.fullSyncStatus;
+  }
+
+  public reissueServerSearch(): boolean {
+    if (this.fullSyncStatus === "too_big" && this.currentSearchQuery.length >= 2) {
+      this.backend.requestSearch(this.currentSearchQuery);
+      return true;
+    }
+    return false;
+  }
+
+  public markPartialSnapshot(): void {
+    if (this.fullSyncStatus === "full") {
+      this.setSyncStatus("unknown");
+    }
+    this.tryResumePendingSearch();
+  }
+
+  private tryResumePendingSearch(): void {
+    if (this.fullSyncStatus !== "unknown") return;
+    if (this.pendingSearchQuery === null) return;
+    this.requestFullSnapshotForQuery(this.pendingSearchQuery);
+  }
+
+  private requestFullSnapshotForQuery(query: string): void {
+    this.backend.requestSnapshot(true).then(snapshot => {
+      if (snapshot === null && this.pendingSearchQuery === query) {
+        this.pendingSearchQuery = null;
+      }
+    }).catch(() => {
+      if (this.pendingSearchQuery === query) this.pendingSearchQuery = null;
+    });
+  }
+
+  private resolvePendingSearch(): void {
+    if (this.pendingSearchQuery === null) return;
+
+    const query = this.pendingSearchQuery;
+    this.pendingSearchQuery = null;
+    if (query === this.currentSearchQuery) {
+      this.handleSearchInput(query);
+    }
+  }
+
+  private handleSearchInput(query: string): void {
+    this.currentSearchQuery = query;
+
+    if (query === "") {
+      this.pendingSearchQuery = null;
+      this.backend.requestSearch("");
+      this.postSearchResults("", []);
+      return;
+    }
+
+    if (this.fullSyncStatus === "full") {
+      this.pendingSearchQuery = null;
+      this.postSearchResults(query, this.computeLocalMatches(query));
+      return;
+    }
+
+    if (this.fullSyncStatus === "too_big") {
+      this.pendingSearchQuery = null;
+      if (query.length < 2) {
+        this.backend.requestSearch("");
+        this.postSearchResults(query, []);
+        return;
+      }
+      if (!this.backend.requestSearch(query)) {
+        this.postSearchResults(query, []);
+      }
+      return;
+    }
+
+    this.pendingSearchQuery = query;
+    this.requestFullSnapshotForQuery(query);
+  }
+
+  public handleSearchResults(query: string, nodes: Node[]): void {
+    if (this.fullSyncStatus !== "too_big") return;
+    if (query.toLowerCase() !== this.currentSearchQuery) return;
+
+    const tokens = this.searchTokens(this.currentSearchQuery);
+    const pathCache = new Map<string, string>();
+    const rows: WebviewNode[] = [];
+    for (const raw of nodes) {
+      const node = this.explorerProvider.getNodeById(raw.id) ?? raw;
+      if (this.matchesTokens(node, tokens, pathCache)) {
+        rows.push(this.serializeNode(node));
+      }
+    }
+    this.postSearchResults(this.currentSearchQuery, rows);
+  }
+
+  private postSearchResults(query: string, nodes: WebviewNode[]): void {
+    this.post({ type: "searchResults", query, nodes });
+  }
+
+  private searchTokens(query: string): string[] {
+    return query.toLowerCase().split(/[\s.]+/).filter(t => t.length > 0);
+  }
+
+  private computeLocalMatches(query: string): WebviewNode[] {
+    const tokens = this.searchTokens(query);
+    if (tokens.length === 0) return [];
+    const pathCache = new Map<string, string>();
+    const rows: WebviewNode[] = [];
+    for (const node of this.explorerProvider.getAllNodes()) {
+      if (this.matchesTokens(node, tokens, pathCache)) {
+        rows.push(this.serializeNode(node));
+        if (rows.length >= MAX_LOCAL_SEARCH_RESULTS) break;
+      }
+    }
+    return rows;
+  }
+
+  private matchesTokens(node: Node, tokens: string[], pathCache: Map<string, string>): boolean {
+    if (tokens.length === 0) return false;
+    const path = this.lowerPath(node, pathCache);
+    const className = node.className.toLowerCase();
+    for (const token of tokens) {
+      if (path.indexOf(token) < 0 && className.indexOf(token) < 0) return false;
+    }
+    return true;
+  }
+
+  private lowerPath(node: Node, cache: Map<string, string>): string {
+    return buildDottedPath(node, (id) => this.explorerProvider.getNodeById(id), cache, true);
+  }
 
   public onSelectionChanged(listener: (nodes: Node[]) => void): void {
     this.selectionListeners.push(listener);
@@ -59,19 +216,32 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "collapseAll" });
   }
 
-  public reveal(node: Node): void {
+  private buildAncestorPreload(node: Node): { chain: string[]; preload: Record<string, WebviewNode[]> } {
     const chain: string[] = [];
     let cur: Node | undefined = node;
     while (cur?.parentId) {
       chain.unshift(cur.parentId);
       cur = this.explorerProvider.getNodeById(cur.parentId);
     }
-    this.selectedIds = [node.id];
     const preload: Record<string, WebviewNode[]> = {};
+    const incompleteAncestors: string[] = [];
     for (const parentId of chain) {
       preload[parentId] = this.serializeChildren(parentId);
       this.knownParentIds.add(parentId);
+      const parentNode = this.explorerProvider.getNodeById(parentId);
+      if (parentNode && parentNode.hasChildren === true && parentNode.childrenLoaded !== true) {
+        incompleteAncestors.push(parentId);
+      }
     }
+    if (incompleteAncestors.length > 0) {
+      this.backend.requestChildren(incompleteAncestors);
+    }
+    return { chain, preload };
+  }
+
+  public reveal(node: Node): void {
+    const { chain, preload } = this.buildAncestorPreload(node);
+    this.selectedIds = [node.id];
     this.post({
       type: "revealNode",
       nodeId: node.id,
@@ -107,6 +277,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     ).toString();
     webviewView.webview.html = this.buildHtml(webviewView.webview, assetBase);
     this.pushSnapshot();
+    this.pushSyncStatus();
     this.pushSelectionColor();
   }
 
@@ -117,11 +288,16 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     ).toString();
     this.webviewView.webview.html = this.buildHtml(this.webviewView.webview, assetBase);
     this.pushSnapshot();
+    this.pushSyncStatus();
   }
 
   public notifySnapshotReplaced(): void {
-    this.knownParentIds.clear();
     this.pushSnapshot();
+  }
+
+  private invalidateParent(invalidate: Set<string>, parentId: string | null): void {
+    if (parentId === null) invalidate.add("");
+    else if (this.knownParentIds.has(parentId)) invalidate.add(parentId);
   }
 
   public notifyDelta(ops: ExplorerDeltaOp[]): void {
@@ -131,29 +307,19 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     for (const op of ops) {
       switch (op.type) {
         case "add_subtree": {
-          const pid = op.parentId;
-          if (pid === null) {
-            invalidate.add("");
-          } else if (this.knownParentIds.has(pid)) {
-            invalidate.add(pid);
-          }
+          this.invalidateParent(invalidate, op.parentId);
           break;
         }
         case "remove_node": {
           const node = this.explorerProvider.getNodeById(op.id);
-          const pid = node?.parentId ?? null;
-          if (pid === null) invalidate.add("");
-          else if (this.knownParentIds.has(pid)) invalidate.add(pid);
+          this.invalidateParent(invalidate, node?.parentId ?? null);
+          this.knownParentIds.delete(op.id);
           break;
         }
         case "move_node": {
           const existing = this.explorerProvider.getNodeById(op.id);
-          const oldPid = existing?.parentId ?? null;
-          const newPid = op.newParentId;
-          if (oldPid === null) invalidate.add("");
-          else if (this.knownParentIds.has(oldPid)) invalidate.add(oldPid);
-          if (newPid === null) invalidate.add("");
-          else if (this.knownParentIds.has(newPid)) invalidate.add(newPid);
+          this.invalidateParent(invalidate, existing?.parentId ?? null);
+          this.invalidateParent(invalidate, op.newParentId);
           break;
         }
         case "update_node": {
@@ -163,11 +329,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
           if (op.name !== undefined) patch.name = op.name;
           if (op.runContext !== undefined) patch.iconClassName = scriptIconClass(node.className, op.runContext);
           if (op.disabled !== undefined && isScriptClass(node.className)) patch.disabled = op.disabled;
+          if (op.hasChildren === true) patch.hasChildren = true;
           if (Object.keys(patch).length > 0) updates.push({ id: op.id, patch });
-          const pid = node.parentId ?? null;
           if (op.name !== undefined) {
-            if (pid === null) invalidate.add("");
-            else if (this.knownParentIds.has(pid)) invalidate.add(pid);
+            this.invalidateParent(invalidate, node.parentId ?? null);
           }
           break;
         }
@@ -183,6 +348,12 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
   public notifyDisabledChanged(id: string, disabled: boolean): void {
     this.post({ type: "updateNode", id, patch: { disabled } });
+  }
+
+  public notifyHasChildrenCleared(ids: string[]): void {
+    for (const id of ids) {
+      this.post({ type: "updateNode", id, patch: { hasChildren: false } });
+    }
   }
 
   private post(msg: unknown): void {
@@ -210,9 +381,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       name: n.name,
       className: n.className,
       iconClassName: scriptIconClass(n.className, n.runContext),
-      hasChildren: n.children.length > 0,
+      hasChildren: n.hasChildren === true || n.children.length > 0,
       isScript,
     };
+    if (n.childrenLoaded) w.childrenLoaded = true;
     if (isScript) w.disabled = !!n.disabled;
     return w;
   }
@@ -227,6 +399,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       rootNodes,
       selectedIds: this.selectedIds,
     });
+  }
+
+  private pushSyncStatus(): void {
+    this.post({ type: "updateSyncStatus", status: this.fullSyncStatus });
   }
 
   private fireSelectionChanged(): void {
@@ -246,24 +422,20 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         const nodes = this.serializeChildren(key);
         this.knownParentIds.add(parentId);
         this.post({ type: "children", parentId, nodes });
+        if (key !== null) {
+          const node = this.explorerProvider.getNodeById(key);
+          if (node && node.hasChildren === true && node.childrenLoaded !== true) {
+            this.backend.requestChildren([key]);
+          }
+        }
         break;
       }
       case "requestAncestors": {
         const targetId = msg.nodeId as string;
         const target = this.explorerProvider.getNodeById(targetId);
-        const chain: string[] = [];
-        const preload: Record<string, WebviewNode[]> = {};
-        if (target) {
-          let cur: Node | undefined = target;
-          while (cur?.parentId) {
-            chain.unshift(cur.parentId);
-            cur = this.explorerProvider.getNodeById(cur.parentId);
-          }
-          for (const pid of chain) {
-            preload[pid] = this.serializeChildren(pid);
-            this.knownParentIds.add(pid);
-          }
-        }
+        const { chain, preload } = target
+          ? this.buildAncestorPreload(target)
+          : { chain: [] as string[], preload: {} as Record<string, WebviewNode[]> };
         this.post({ type: "ancestors", nodeId: targetId, chain, preload });
         break;
       }
@@ -300,6 +472,23 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         }
         const items = this.contextMenuRegistry.itemsFor(node);
         this.post({ type: "showContextMenu", requestId: msg.requestId, nodeId: node.id, items });
+        break;
+      }
+      case "requestSearch": {
+        const query = typeof msg.query === "string" ? msg.query : "";
+        this.handleSearchInput(query);
+        break;
+      }
+      case "releaseSubtree": {
+        const parentIds = Array.isArray(msg.parentIds)
+          ? msg.parentIds.filter((id: unknown): id is string => typeof id === "string")
+          : [];
+        if (parentIds.length > 0) {
+          const descendantIds = this.explorerProvider.markSubtreeUnloaded(parentIds);
+          for (const id of parentIds) { this.knownParentIds.delete(id); }
+          for (const id of descendantIds) { this.knownParentIds.delete(id); }
+          this.backend.releaseSubtree(parentIds, descendantIds);
+        }
         break;
       }
       case "reparentNode": {
@@ -344,6 +533,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (result.data && typeof result.data === "string") {
+        this.backend.requestChildren([parentId]);
         const newNode = await this.waitForNode(result.data);
         if (newNode) {
           this.reveal(newNode);
@@ -464,6 +654,9 @@ var lastClickTime=0,lastClickId=null;
 
 var expandedIds=new Set();
 var dragSourceId=null;
+var saved=vscode.getState();
+if(saved&&Array.isArray(saved.exp))expandedIds=new Set(saved.exp);
+function saveExp(){vscode.setState({exp:[...expandedIds]})}
 
 function ingestNodes(arr){
   if(!arr)return;
@@ -474,9 +667,37 @@ function storeChildren(parentId,arr){
   var ids=[];
   for(var i=0;i<arr.length;i++)ids.push(arr[i].id);
   childrenByParent[parentId]=ids;
+  if(nodes[parentId])nodes[parentId].childrenLoaded=true;
 }
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+var lastSearchQuerySent=null;
+var localSyncStatus='unknown';
+var searchResultIds=null;
+function sendSearchQuery(q){
+  if(q===lastSearchQuerySent)return;
+  lastSearchQuerySent=q;
+  vscode.postMessage({type:'requestSearch',query:q});
+}
+function releaseSubtree(id){
+  if(localSyncStatus==='full')return;
+  if(searchFilter)return;
+  var n=nodes[id];
+  if(!n||n.childrenLoaded!==true)return;
+  if(childrenByParent[id]===undefined&&!pendingChildren[id])return;
+  var stack=[id];
+  while(stack.length){
+    var pid=stack.pop();
+    var kids=childrenByParent[pid];
+    if(kids){for(var i=0;i<kids.length;i++)stack.push(kids[i])}
+    if(pid!==id)expandedIds.delete(pid);
+    delete childrenByParent[pid];
+    delete pendingChildren[pid];
+  }
+  saveExp();
+  vscode.postMessage({type:'releaseSubtree',parentIds:[id]});
+}
 
 var treeEl=document.getElementById('tree');
 var spacerEl=document.getElementById('tree-spacer');
@@ -505,6 +726,13 @@ window.addEventListener('message',function(e){
       rootIds=[];for(var i=0;i<(m.rootNodes||[]).length;i++)rootIds.push(m.rootNodes[i].id);
       childrenByParent['']=rootIds.slice();
       selectedIds=m.selectedIds||[];
+      lastSearchQuerySent=null;searchResultIds=null;
+      if(searchFilter)sendSearchQuery(searchFilter);
+      renderTree();break;
+    case 'searchResults':
+      if(m.query!==searchFilter)break;
+      ingestNodes(m.nodes||[]);
+      searchResultIds=[];for(var i=0;i<(m.nodes||[]).length;i++)searchResultIds.push(m.nodes[i].id);
       renderTree();break;
     case 'children':
       delete pendingChildren[m.parentId];
@@ -533,6 +761,9 @@ window.addEventListener('message',function(e){
         renderTree();
       }
       break;
+    case 'updateSyncStatus':
+      localSyncStatus=m.status||'unknown';
+      break;
     case 'updateSelection':
       selectedIds=m.selectedIds||[];updateSelVis();break;
     case 'revealNode':
@@ -541,7 +772,7 @@ window.addEventListener('message',function(e){
       for(var pid in pre){storeChildren(pid,pre[pid])}
       for(var i=0;i<chain.length;i++)expandedIds.add(chain[i]);
       selectedIds=m.selectedIds||[];
-      renderTree();
+      saveExp();renderTree();
       requestAnimationFrame(function(){scrollTo(m.nodeId);treeEl.focus()});break;
     case 'focusTree':
       treeEl.focus();break;
@@ -552,7 +783,7 @@ window.addEventListener('message',function(e){
         expandedIds.add(id);
         if(!childrenByParent[id])requestChildren(id);
       });
-      renderTree();break;
+      saveExp();renderTree();break;
     case 'startRename':
       renameNodeId=m.nodeId||null;
       renderTree();
@@ -576,8 +807,16 @@ window.addEventListener('message',function(e){
       }
       break;
     case 'collapseAll':
+      if(localSyncStatus!=='full'&&!searchFilter){
+        var loadedParentIds=[];
+        for(var pid in childrenByParent){if(pid!==''&&childrenByParent[pid]!==undefined)loadedParentIds.push(pid)}
+        if(loadedParentIds.length>0){
+          for(var i=0;i<loadedParentIds.length;i++){delete childrenByParent[loadedParentIds[i]];delete pendingChildren[loadedParentIds[i]]}
+          vscode.postMessage({type:'releaseSubtree',parentIds:loadedParentIds});
+        }
+      }
       expandedIds.clear();
-      renderTree();
+      saveExp();renderTree();
       if(selectedIds.length>0)requestAnimationFrame(function(){scrollTo(selectedIds[0])});
       break;
     case 'showContextMenu':
@@ -593,10 +832,22 @@ var searchFilter='';
 searchEl.addEventListener('input',function(){
   var raw=searchEl.value.trim().toLowerCase();
   if(searchDebounce)clearTimeout(searchDebounce);
-  searchDebounce=setTimeout(function(){searchFilter=raw;renderTree()},50);
+  if(!raw){
+    lastSearchQuerySent=null;searchResultIds=null;
+    sendSearchQuery('');
+    searchFilter='';renderTree();return;
+  }
+  searchDebounce=setTimeout(function(){
+    if(raw!==searchFilter)searchResultIds=null;
+    sendSearchQuery(raw);
+    searchFilter=raw;renderTree();
+  },50);
 });
 searchEl.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
+    if(searchDebounce){clearTimeout(searchDebounce);searchDebounce=null}
+    lastSearchQuerySent=null;searchResultIds=null;
+    sendSearchQuery('');
     searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault();
   }
 });
@@ -630,25 +881,23 @@ var flatRows=[];
 var vLastStart=-1,vLastEnd=-1;
 var scrollRaf=false;
 
-function nodeMatches(n){
-  if(!searchFilter)return true;
-  return n.name.toLowerCase().indexOf(searchFilter)>=0||n.className.toLowerCase().indexOf(searchFilter)>=0;
-}
-
 function buildFlatRows(){
   flatRows=[];
+  if(searchFilter){
+    var ids=searchResultIds||[];
+    for(var i=0;i<ids.length;i++){if(nodes[ids[i]])flatRows.push({id:ids[i],depth:0})}
+    return;
+  }
   function walk(id,depth){
     var n=nodes[id];if(!n)return;
     flatRows.push({id:id,depth:depth});
     if(expandedIds.has(id)){
       var kids=childrenByParent[id];
-      if(kids){for(var i=0;i<kids.length;i++)walk(kids[i],depth+1)}
+      if(kids===undefined){if(n.hasChildren===true)requestChildren(id)}
+      else{for(var i=0;i<kids.length;i++)walk(kids[i],depth+1)}
     }
   }
   for(var i=0;i<rootIds.length;i++)walk(rootIds[i],0);
-  if(searchFilter){
-    flatRows=flatRows.filter(function(r){var n=nodes[r.id];return n&&nodeMatches(n)});
-  }
 }
 
 function renderTree(){
@@ -680,7 +929,7 @@ function renderViewport(){
 
 function buildRowHtml(id,depth,rowIndex,h){
   var n=nodes[id];if(!n)return;
-  var has=n.hasChildren;
+  var has=n.hasChildren===true;
   var exp=expandedIds.has(id);
   var sel=selectedIds.indexOf(id)>=0;
   var pad=depth*INDENT;
@@ -737,11 +986,12 @@ function scrollTo(id){
 }
 
 function toggleExpand(id){
-  if(expandedIds.has(id)){expandedIds.delete(id)}
+  if(expandedIds.has(id)){expandedIds.delete(id);releaseSubtree(id)}
   else{
     expandedIds.add(id);
     if(!childrenByParent[id])requestChildren(id);
   }
+  saveExp();
   renderTree();
 }
 
@@ -765,7 +1015,7 @@ treeEl.addEventListener('click',function(e){
     lastClickId=null;
     if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id});return}
     var node=nodes[id];
-    if(node&&node.hasChildren){toggleExpand(id)}
+    if(node&&node.hasChildren===true){toggleExpand(id)}
     return;
   }
   if(e.ctrlKey||e.metaKey){var i=selectedIds.indexOf(id);if(i>=0)selectedIds.splice(i,1);else selectedIds.push(id)}

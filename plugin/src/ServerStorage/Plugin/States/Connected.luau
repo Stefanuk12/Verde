@@ -1,17 +1,17 @@
 local HttpService = game:GetService("HttpService")
 
-local SharedFolder = script.Parent.Parent.Shared
+local SharedFolder = require(script.Parent.Parent.Shared)
 
 local SerializeDatamodel = require(script.Parent.Parent.SerializeDatamodel)
 local isValidInstance = require(script.Parent.Parent.Utils.isValidInstance)
 local WebSocketClient = require(script.Parent.Parent.WebSocketClient)
 local InstanceMap = require(script.Parent.Parent.Shared.InstanceMap)
-local Services = require(script.Parent.Parent.Shared.Services)
 local Promise = require(script.Parent.Parent.Packages.Promise)
-local PropertyTracker = require(SharedFolder.PropertyTracker)
-local ButtonInstance = require(SharedFolder.ButtonInstance)
-local Icons = require(SharedFolder.Icons)
-local State = require(SharedFolder.State)
+local PropertyTracker = SharedFolder.PropertyTracker
+local ButtonInstance = SharedFolder.ButtonInstance
+local Icons = SharedFolder.Icons
+local State = SharedFolder.State
+local Operations = require(script.Parent.Parent.Operations)
 
 type Client = WebSocketClient.WebSocketClientInstance
 
@@ -19,114 +19,81 @@ local PROPERTIES_TO_WATCH = {
 	"Name",
 }
 
-local operations: { [string]: (...any) -> boolean } = {}
+local MAX_FULL_SYNC_NODES = 50000
+
 local connections: { RBXScriptConnection } = {}
+local instanceConnections: { [string]: { RBXScriptConnection } } = {}
 local snapshotPromise: any = nil
 local deltaPromise: any = nil
 local pendingOps: { any } = {}
 
+local loadedParents: { [string]: true } = {}
+local ROOT_PARENT_KEY = "__root__"
+local fullSyncMode = false
+
+local searchGraftedIds: { [string]: true } = {}
+local lastSearchLower = ""
+local lastSearchMatched: { Instance } = {}
+local lastSearchTruncated = false
+local searchCacheDirty = false
+local searchGeneration = 0
+
 local lastAckTime = 0
 local initialSyncComplete = false
 
-local function _fillInstanceMap(instance: Instance)
-	InstanceMap[instance:GetDebugId(0)] = instance
-	for _, child in instance:GetChildren() do
-		_fillInstanceMap(child)
+local function _resetSearchCache()
+	lastSearchLower = ""
+	lastSearchMatched = {}
+	lastSearchTruncated = false
+	searchCacheDirty = false
+end
+
+local function _disconnectInstance(id: string)
+	local conns = instanceConnections[id]
+	if not conns then
+		return
 	end
+
+	for _, conn in conns do
+		conn:Disconnect()
+	end
+
+	instanceConnections[id] = nil
 end
 
-for _, operationMod in script.Parent.Parent.Operations:GetChildren() do
-	local operation = require(operationMod)
-	operations[operationMod.Name] = operation
+local function _trackInstance(id: string, conn: RBXScriptConnection)
+	local list = instanceConnections[id]
+	if not list then
+		list = {}
+		instanceConnections[id] = list
+	end
+
+	table.insert(list, conn)
 end
 
-local SNAPSHOT_CHUNK_SIZE = 2000
-local snapshotInFlight = false
+local function _parentDebugId(instance: Instance): string?
+	local parent = instance.Parent
+	if parent and parent ~= game then
+		return parent:GetDebugId(0)
+	end
+	return nil
+end
 
-local function _sendJson(client: Client, message: any, label: string): boolean
+local function _encodeAndSend(client: Client, message: any): boolean
+	if not client or not client.connected then
+		return false
+	end
+
 	local jsonSuccess, jsonString = pcall(function()
 		return HttpService:JSONEncode(message)
 	end)
+
 	if not jsonSuccess then
-		warn(string.format("[verde] %s: failed to encode JSON: %s", label, tostring(jsonString)))
+		warn("[verde] failed to encode message:", message.type, jsonString)
 		return false
 	end
-	if not client:send(jsonString) then
-		warn(string.format("[verde] %s: failed to send (payload %d bytes)", label, #jsonString))
-		return false
-	end
-	return true
-end
 
-local function _sendSnapshot(client: Client)
-	if not client or not client.connected then
-		print("sendSnapshot: not connected")
-		return
-	end
-
-	if snapshotInFlight then
-		return
-	end
-	snapshotInFlight = true
-
-	local snapshot, _instanceMap = SerializeDatamodel.serializeFull()
-
-	for id, instance in _instanceMap do
-		InstanceMap[id] = instance
-	end
-
-	local nodes = snapshot.nodes
-	local total = #nodes
-
-	if
-		not _sendJson(client, {
-			type = "explorer_snapshot_start",
-			rootIds = snapshot.rootIds,
-			totalNodes = total,
-		}, "snapshot_start")
-	then
-		snapshotInFlight = false
-		return
-	end
-
-	for startIndex = 1, math.max(total, 1), SNAPSHOT_CHUNK_SIZE do
-		if not client.connected then
-			warn("[verde] snapshot stream aborted: client disconnected")
-			snapshotInFlight = false
-			return
-		end
-
-		local endIndex = math.min(startIndex + SNAPSHOT_CHUNK_SIZE - 1, total)
-		local chunk = table.create(endIndex - startIndex + 1)
-		for i = startIndex, endIndex do
-			chunk[#chunk + 1] = nodes[i]
-		end
-
-		if not _sendJson(client, {
-			type = "explorer_snapshot_chunk",
-			nodes = chunk,
-		}, "snapshot_chunk") then
-			snapshotInFlight = false
-			return
-		end
-
-		task.wait()
-
-		if total == 0 then
-			break
-		end
-	end
-
-	if not _sendJson(client, {
-		type = "explorer_snapshot_end",
-	}, "snapshot_end") then
-		snapshotInFlight = false
-		return
-	end
-
-	lastAckTime = tick()
-	initialSyncComplete = true
-	snapshotInFlight = false
+	return client:send(jsonString) == true
 end
 
 local function _flushDelta(client: Client)
@@ -134,10 +101,9 @@ local function _flushDelta(client: Client)
 		return
 	end
 
-	local addedRootIds: { string }? = nil
+	local addedRootIds: { string } = {}
 	for _, op in pendingOps do
 		if op.type == "add_subtree" and op.addedRootId then
-			addedRootIds = addedRootIds or {}
 			table.insert(addedRootIds, op.addedRootId)
 		end
 	end
@@ -146,7 +112,7 @@ local function _flushDelta(client: Client)
 		type = "explorer_delta",
 		ops = pendingOps,
 	}
-	if addedRootIds then
+	if #addedRootIds > 0 then
 		message.addedRootIds = addedRootIds
 	end
 
@@ -163,7 +129,16 @@ local function _flushDelta(client: Client)
 		return
 	end
 
-	client:send(jsonString)
+	if not client:send(jsonString) then
+		warn("[verde] failed to send explorer_delta (will retry)")
+		pendingOps = opsToSend
+		if not deltaPromise then
+			deltaPromise = Promise.delay(0.1):andThen(function()
+				deltaPromise = nil
+				_flushDelta(client)
+			end)
+		end
+	end
 end
 
 local function _pushOp(client: Client, op: any)
@@ -176,6 +151,197 @@ local function _pushOp(client: Client, op: any)
 		deltaPromise = nil
 		_flushDelta(client)
 	end)
+end
+
+local function _pushHasChildren(client: Client, id: string, hasChildren: boolean)
+	_pushOp(client, {
+		type = "update_node",
+		timestamp = tick(),
+		id = id,
+		hasChildren = hasChildren,
+	})
+end
+
+local function _listenToChanges(client: Client, descendant: Instance)
+	local id = descendant:GetDebugId(0)
+
+	for _, property in PROPERTIES_TO_WATCH do
+		_trackInstance(
+			id,
+			descendant:GetPropertyChangedSignal(property):Connect(function()
+				searchCacheDirty = true
+				_pushOp(client, {
+					type = "update_node",
+					timestamp = tick(),
+					id = id,
+					name = descendant.Name,
+				})
+			end)
+		)
+	end
+
+	if descendant:IsA("BaseScript") then
+		for _, propName in ipairs({ "Enabled", "Disabled", "RunContext" }) do
+			_trackInstance(
+				id,
+				descendant:GetPropertyChangedSignal(propName):Connect(function()
+					local bs = descendant :: BaseScript
+					_pushOp(client, {
+						type = "update_node",
+						timestamp = tick(),
+						id = id,
+						disabled = not bs.Enabled,
+						runContext = bs.RunContext.Name,
+					})
+				end)
+			)
+		end
+	end
+
+	_trackInstance(
+		id,
+		descendant.AncestryChanged:Connect(function()
+			searchCacheDirty = true
+			local newParentId = _parentDebugId(descendant)
+			_pushOp(client, {
+				type = "move_node",
+				timestamp = tick(),
+				id = id,
+				newParentId = newParentId,
+			})
+		end)
+	)
+
+	_trackInstance(
+		id,
+		descendant.ChildAdded:Connect(function(child)
+			local function flagHasChildren()
+				_pushHasChildren(client, id, true)
+			end
+
+			if not loadedParents[id] then
+				flagHasChildren()
+				return
+			end
+
+			local childId = child:GetDebugId(0)
+			if instanceConnections[childId] or not isValidInstance(child) then
+				flagHasChildren()
+				return
+			end
+
+			local node = SerializeDatamodel.serializeShallow(child, id)
+			InstanceMap[node.id] = child
+			_listenToChanges(client, child)
+			_pushOp(client, {
+				type = "add_subtree",
+				timestamp = tick(),
+				parentId = id,
+				rootId = node.id,
+				nodes = { node },
+			})
+		end)
+	)
+	_trackInstance(
+		id,
+		descendant.ChildRemoved:Connect(function()
+			_pushHasChildren(client, id, #descendant:GetChildren() > 0)
+		end)
+	)
+end
+
+local function _parentKey(instance: Instance): string?
+	return _parentDebugId(instance) or ROOT_PARENT_KEY
+end
+
+local function _shouldSyncNewDescendant(descendant: Instance): boolean
+	if fullSyncMode then
+		return true
+	end
+
+	local key = _parentKey(descendant)
+	return key ~= nil and loadedParents[key] == true
+end
+
+local function _sendSnapshotTooBig(client: Client)
+	_encodeAndSend(client, { type = "snapshot_too_big" })
+end
+
+local function _sendSnapshot(client: Client, full: boolean?)
+	if not client or not client.connected then
+		print("sendSnapshot: not connected")
+		return
+	end
+
+	local snapshot, instanceMap
+	if full then
+		snapshot, instanceMap = SerializeDatamodel.serializeFull(MAX_FULL_SYNC_NODES)
+		if not snapshot or not instanceMap then
+			fullSyncMode = false
+			_sendSnapshotTooBig(client)
+			return
+		end
+	else
+		snapshot, instanceMap = SerializeDatamodel.serializeRoots()
+	end
+
+	if deltaPromise then
+		deltaPromise:cancel()
+		deltaPromise = nil
+	end
+	table.clear(pendingOps)
+
+	-- Both full and partial (roots-only) snapshots reset the extension's tree to
+	-- the nodes in this snapshot, and we disconnect every per-instance listener
+	-- below regardless of `full`. Clear InstanceMap unconditionally so it stays
+	-- consistent with that reset; otherwise a partial resend (e.g. the
+	-- refreshExplorer full->partial fallback) would leak stale ids that point at
+	-- now-unlistened instances.
+	table.clear(InstanceMap)
+	for id, _ in instanceConnections do
+		_disconnectInstance(id)
+	end
+	for key, _ in loadedParents do
+		loadedParents[key] = nil
+	end
+	table.clear(searchGraftedIds)
+	_resetSearchCache()
+
+	if full then
+		fullSyncMode = true
+		for id, _ in instanceMap do
+			loadedParents[id] = true
+		end
+	else
+		fullSyncMode = false
+	end
+
+	loadedParents[ROOT_PARENT_KEY] = true
+
+	for id, instance in instanceMap do
+		InstanceMap[id] = instance
+		_listenToChanges(client, instance)
+	end
+
+	if
+		not _encodeAndSend(client, {
+			type = "explorer_snapshot",
+			payload = snapshot,
+			isFull = full == true,
+		})
+	then
+		warn("[verde] failed to send explorer_snapshot (will retry)")
+		if not snapshotPromise then
+			snapshotPromise = Promise.delay(0.1):andThen(function()
+				snapshotPromise = nil
+				_sendSnapshot(client, full)
+			end)
+		end
+		return
+	end
+
+	lastAckTime = tick()
+	initialSyncComplete = true
 end
 
 local function _sendOperationResult(
@@ -217,7 +383,7 @@ local function _sendOperationResult(
 end
 
 local propertyUpdatePromise: any = nil
-local getProperties = require(script.Parent.Parent.Operations.get_properties)
+local getProperties = Operations.get_properties
 
 local function _sendPropertyUpdate(client: Client, nodeId: string)
 	if not client or not client.connected then
@@ -236,22 +402,11 @@ local function _sendPropertyUpdate(client: Client, nodeId: string)
 			return
 		end
 
-		local message = {
+		_encodeAndSend(client, {
 			type = "property_update",
 			nodeId = nodeId,
 			properties = propertiesResult,
-		}
-
-		local jsonSuccess, jsonString = pcall(function()
-			return HttpService:JSONEncode(message)
-		end)
-
-		if not jsonSuccess then
-			warn("[verde] failed to encode property update:", jsonString)
-			return
-		end
-
-		client:send(jsonString)
+		})
 	end)
 end
 
@@ -261,7 +416,7 @@ local function _handleOperation(client: Client, operationId: string, operation: 
 		return
 	end
 
-	local operationFunction = operations[operation.type]
+	local operationFunction = Operations[operation.type]
 
 	if operationFunction then
 		local result, errorMsg = operationFunction(operation)
@@ -276,7 +431,7 @@ local function _handleOperation(client: Client, operationId: string, operation: 
 	end
 end
 
-local function _sendAck(client: Client, requestId: string?, force: boolean?)
+local function _sendAck(client: Client, requestId: string?)
 	lastAckTime = tick()
 
 	local message = {
@@ -287,20 +442,180 @@ local function _sendAck(client: Client, requestId: string?, force: boolean?)
 		message.requestId = requestId
 	end
 
+	_encodeAndSend(client, message)
+end
+
+local function _registerAndTrack(client: Client, id: string, instance: Instance)
+	if not InstanceMap[id] then
+		InstanceMap[id] = instance
+	end
+	if not instanceConnections[id] then
+		_listenToChanges(client, instance)
+	end
+end
+
+local function _releaseSearchGrafted(keep: { [string]: Instance }?)
+	for id in searchGraftedIds do
+		if keep and keep[id] then
+			continue
+		end
+		if loadedParents[id] then
+			searchGraftedIds[id] = nil
+			continue
+		end
+		local instance = InstanceMap[id]
+		if instance then
+			local parentKey = _parentKey(instance)
+			if parentKey and loadedParents[parentKey] then
+				searchGraftedIds[id] = nil
+				continue
+			end
+		end
+		_disconnectInstance(id)
+		searchGraftedIds[id] = nil
+	end
+end
+
+local function _handleRequestSearch(client: Client, query: string?)
 	if not client or not client.connected then
 		return
 	end
 
-	local jsonSuccess, jsonString = pcall(function()
-		return HttpService:JSONEncode(message)
-	end)
+	searchGeneration += 1
+	local generation = searchGeneration
 
-	if not jsonSuccess then
-		warn("[verde] failed to encode ack:", jsonString)
+	local trimmed = query and string.gsub(query, "^%s*(.-)%s*$", "%1") or ""
+	if #trimmed < 2 then
+		_releaseSearchGrafted(nil)
+		_resetSearchCache()
 		return
 	end
 
-	client:send(jsonString)
+	local lowercase = string.lower(trimmed)
+
+	local candidates: { Instance }? = nil
+	if
+		fullSyncMode
+		and lastSearchLower ~= ""
+		and not lastSearchTruncated
+		and not searchCacheDirty
+		and #lowercase >= #lastSearchLower
+		and string.sub(lowercase, 1, #lastSearchLower) == lastSearchLower
+	then
+		candidates = lastSearchMatched
+	end
+
+	searchCacheDirty = false
+
+	local nodes, resultInstanceMap, truncated, matched =
+		SerializeDatamodel.serializeSearchResults(lowercase, candidates)
+
+	if generation ~= searchGeneration then
+		return
+	end
+
+	lastSearchLower = lowercase
+	lastSearchMatched = matched
+	lastSearchTruncated = truncated
+
+	_releaseSearchGrafted(resultInstanceMap)
+	for id, instance in resultInstanceMap do
+		_registerAndTrack(client, id, instance)
+		if not loadedParents[id] then
+			searchGraftedIds[id] = true
+		end
+	end
+
+	_encodeAndSend(client, {
+		type = "search_result",
+		query = trimmed,
+		nodes = nodes,
+		truncated = truncated,
+	})
+end
+
+local function _handleRequestChildren(client: Client, parentIds: { string })
+	if not parentIds or #parentIds == 0 then
+		return
+	end
+
+	for _, parentId in parentIds do
+		local parentInstance = InstanceMap[parentId]
+		if not parentInstance then
+			warn("[verde] request_children for unknown parent:", parentId)
+			continue
+		end
+
+		if loadedParents[parentId] then
+			continue
+		end
+
+		local children, childInstanceMap = SerializeDatamodel.serializeChildren(parentInstance)
+		for id, instance in childInstanceMap do
+			_registerAndTrack(client, id, instance)
+		end
+
+		loadedParents[parentId] = true
+
+		if #children == 0 then
+			_pushHasChildren(client, parentId, false)
+			continue
+		end
+
+		_pushOp(client, {
+			type = "add_subtree",
+			timestamp = tick(),
+			parentId = parentId,
+			rootId = children[1].id,
+			nodes = children,
+		})
+	end
+end
+
+local function _handleReleaseSubtree(parentIds: { string }, nodeIds: { string })
+	if fullSyncMode then
+		return
+	end
+
+	local released: { [string]: true } = {}
+	if parentIds then
+		for _, parentId in parentIds do
+			loadedParents[parentId] = nil
+			released[parentId] = true
+		end
+	end
+
+	if nodeIds then
+		for _, id in nodeIds do
+			_disconnectInstance(id)
+			loadedParents[id] = nil
+			searchGraftedIds[id] = nil
+			released[id] = true
+		end
+	end
+
+	if next(released) ~= nil and #pendingOps > 0 then
+		local kept: { any } = {}
+		for _, op in pendingOps do
+			if op.type == "add_subtree" then
+				local drop = (op.parentId ~= nil and released[op.parentId] == true)
+					or (op.rootId ~= nil and released[op.rootId] == true)
+				if not drop and op.nodes then
+					for _, node in op.nodes do
+						if node.id ~= nil and released[node.id] == true then
+							drop = true
+							break
+						end
+					end
+				end
+				if drop then
+					continue
+				end
+			end
+			table.insert(kept, op)
+		end
+		pendingOps = kept
+	end
 end
 
 local _messageHandlers = {
@@ -308,60 +623,22 @@ local _messageHandlers = {
 		_handleOperation(client, data.operationId, data.operation)
 	end,
 	["request_snapshot"] = function(client: Client, data: any)
-		_sendSnapshot(client)
+		local full = data and data.full == true
+		_sendSnapshot(client, full)
+	end,
+	["request_children"] = function(client: Client, data: any)
+		_handleRequestChildren(client, data.parentIds or {})
+	end,
+	["release_subtree"] = function(_client: Client, data: any)
+		_handleReleaseSubtree(data and data.parentIds or {}, data and data.nodeIds or {})
+	end,
+	["request_search"] = function(client: Client, data: any)
+		_handleRequestSearch(client, data and data.query)
 	end,
 	["ack"] = function(client: Client, data: any)
 		_sendAck(client, data.requestId)
 	end,
 }
-
-local function _listenToChanges(client: Client, descendant: Instance)
-	for _, property in PROPERTIES_TO_WATCH do
-		table.insert(
-			connections,
-			descendant:GetPropertyChangedSignal(property):Connect(function()
-				_pushOp(client, {
-					type = "update_node",
-					timestamp = tick(),
-					id = descendant:GetDebugId(0),
-					name = descendant.Name,
-				})
-			end)
-		)
-	end
-
-	if descendant:IsA("BaseScript") then
-		for _, propName in ipairs({ "Enabled", "Disabled", "RunContext" }) do
-			table.insert(
-				connections,
-				descendant:GetPropertyChangedSignal(propName):Connect(function()
-					local bs = descendant :: BaseScript
-					_pushOp(client, {
-						type = "update_node",
-						timestamp = tick(),
-						id = descendant:GetDebugId(0),
-						disabled = not bs.Enabled,
-						runContext = bs.RunContext.Name,
-					})
-				end)
-			)
-		end
-	end
-
-	table.insert(
-		connections,
-		descendant.AncestryChanged:Connect(function()
-			local parent = descendant.Parent
-			local newParentId = if parent and parent ~= game then parent:GetDebugId(0) else nil
-			_pushOp(client, {
-				type = "move_node",
-				timestamp = tick(),
-				id = descendant:GetDebugId(0),
-				newParentId = newParentId,
-			})
-		end)
-	)
-end
 
 local connected = State.new()
 
@@ -390,16 +667,6 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 		end
 	end)
 
-	for _, serviceName in Services do
-		local service = game:GetService(serviceName)
-
-		_listenToChanges(client, service)
-
-		for _, descendant in service:GetDescendants() do
-			_listenToChanges(client, descendant)
-		end
-	end
-
 	table.insert(
 		connections,
 		game.DescendantAdded:Connect(function(descendant)
@@ -407,31 +674,36 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 				return
 			end
 
-			_listenToChanges(client, descendant)
+			searchCacheDirty = true
 
-			local parent = descendant.Parent
-			if parent and parent ~= game then
-				if not InstanceMap[parent:GetDebugId(0)] then
-					return
+			if not _shouldSyncNewDescendant(descendant) then
+				local parentId = _parentDebugId(descendant)
+				if parentId and InstanceMap[parentId] then
+					_pushHasChildren(client, parentId, true)
 				end
-			end
-
-			local rootId, nodes = SerializeDatamodel.serializeSubtree(descendant)
-			if not rootId or not nodes then
 				return
 			end
-			_fillInstanceMap(descendant)
 
-			local parentId = if parent and parent ~= game then parent:GetDebugId(0) else nil
+			if instanceConnections[descendant:GetDebugId(0)] then
+				return
+			end
+
+			local parentId = _parentDebugId(descendant)
+
+			local node = SerializeDatamodel.serializeShallow(descendant, parentId)
+
+			InstanceMap[node.id] = descendant
+			_listenToChanges(client, descendant)
+
 			local op: any = {
 				type = "add_subtree",
 				timestamp = tick(),
 				parentId = parentId,
-				rootId = rootId,
-				nodes = nodes,
+				rootId = node.id,
+				nodes = { node },
 			}
-			if parent == game then
-				op.addedRootId = rootId
+			if parentId == nil then
+				op.addedRootId = node.id
 			end
 			_pushOp(client, op)
 		end)
@@ -445,7 +717,12 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 				return
 			end
 
+			searchCacheDirty = true
+
 			InstanceMap[instanceId] = nil
+			_disconnectInstance(instanceId)
+			loadedParents[instanceId] = nil
+			searchGraftedIds[instanceId] = nil
 
 			_pushOp(client, {
 				type = "remove_node",
@@ -461,6 +738,7 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 
 	lastAckTime = tick()
 	initialSyncComplete = false
+	_sendSnapshot(client, false)
 end
 
 connected.onExit = function()
@@ -479,6 +757,10 @@ connected.onExit = function()
 		connection:Disconnect()
 	end
 
+	for id, _ in instanceConnections do
+		_disconnectInstance(id)
+	end
+
 	if snapshotPromise then
 		snapshotPromise:cancel()
 	end
@@ -494,9 +776,14 @@ connected.onExit = function()
 	table.clear(connections)
 	table.clear(pendingOps)
 	table.clear(InstanceMap)
+	for key, _ in loadedParents do
+		loadedParents[key] = nil
+	end
+	table.clear(searchGraftedIds)
+	_resetSearchCache()
+	fullSyncMode = false
 	lastAckTime = tick()
 	initialSyncComplete = false
-	snapshotInFlight = false
 end
 
 connected.onUpdate = function(dt, transitionTo: (string) -> ())

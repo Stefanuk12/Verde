@@ -1,44 +1,38 @@
 local RunService = game:GetService("RunService")
 
 local StateModule = require(script.Parent.Parent.Shared.State)
+local States = require(script.Parent)
 
 type State = StateModule.State
 
 local _currentState: State? = nil
-local _states = {}
 
 local StateController = {}
 
-for _, stateModule in script.Parent:GetChildren() do
-	if stateModule == script or not stateModule:IsA("ModuleScript") then
-		continue
-	end
-
-	local state = require(stateModule)
-	_states[stateModule.Name] = state
-end
-
-local function _transitionTo(stateName: string)
-	StateController.SwitchState(stateName)
-end
+local _transitionTo: (stateName: string) -> ()
 
 function StateController.SwitchState(stateName: string)
-	assert(_states[stateName], "State not found")
+	assert(States[stateName], "State not found")
 
 	local retValue = nil
 
 	if _currentState then
-		retValue = _currentState:onExit()
+		retValue = _currentState.onExit()
 	end
 
-	_currentState = _states[stateName]
-	_currentState.onEnter(_transitionTo, retValue)
+	local state = States[stateName]
+	_currentState = state
+	state.onEnter(_transitionTo, retValue)
+end
+
+function _transitionTo(stateName: string)
+	StateController.SwitchState(stateName)
 end
 
 function StateController.GetState(): string?
 	local stateName = nil
 
-	for name, state in _states do
+	for name, state in States do
 		if state == _currentState then
 			stateName = name
 			break
@@ -48,7 +42,7 @@ function StateController.GetState(): string?
 	return stateName
 end
 
-RunService.Heartbeat:Connect(function(dt)
+local _heartbeatConnection: RBXScriptConnection? = RunService.Heartbeat:Connect(function(dt)
 	if RunService:IsRunning() then
 		return
 	end
@@ -59,5 +53,12 @@ RunService.Heartbeat:Connect(function(dt)
 
 	_currentState.onUpdate(dt, _transitionTo)
 end)
+
+function StateController.Cleanup()
+	if _heartbeatConnection then
+		_heartbeatConnection:Disconnect()
+		_heartbeatConnection = nil
+	end
+end
 
 return StateController

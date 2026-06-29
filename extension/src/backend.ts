@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { WebSocketServer, WebSocket, RawData } from "ws";
-import { Snapshot } from "./robloxExplorerProvider";
+import { Snapshot, Node } from "./robloxExplorerProvider";
 
 export type Operation =
     | { type: "move_node"; nodeId: string; newParentId: string | null }
@@ -73,14 +73,11 @@ export type TextRange = {
 export type ExplorerDeltaOp =
     | { type: "add_subtree"; timestamp: number; parentId: string | null; rootId: string; nodes: Snapshot["nodes"] }
     | { type: "remove_node"; timestamp: number; id: string }
-    | { type: "update_node"; timestamp: number; id: string; name?: string; disabled?: boolean; runContext?: string }
+    | { type: "update_node"; timestamp: number; id: string; name?: string; disabled?: boolean; runContext?: string; hasChildren?: boolean }
     | { type: "move_node"; timestamp: number; id: string; newParentId: string | null };
 
 type RobloxInboundMessage =
     | { type: "explorer_snapshot"; requestId?: string; payload?: Snapshot }
-    | { type: "explorer_snapshot_start"; requestId?: string; rootIds: string[]; totalNodes: number }
-    | { type: "explorer_snapshot_chunk"; requestId?: string; nodes: Snapshot["nodes"] }
-    | { type: "explorer_snapshot_end"; requestId?: string }
     | { type: "explorer_delta"; ops: ExplorerDeltaOp[]; addedRootIds?: string[] }
     | { type: "operation_result"; requestId?: string; operationId: string; result: OperationResult }
     | { type: "property_update"; nodeId: string; properties: PropertiesData }
@@ -92,39 +89,54 @@ type BackendOutboundMessage =
     | { type: "ack"; requestId?: string }
     | { type: "error"; requestId?: string; message: string }
     | { type: "operation"; requestId?: string; operationId: string; operation: Operation }
-    | { type: "request_snapshot"; requestId?: string };
+    | { type: "request_snapshot"; requestId?: string; full?: boolean }
+    | { type: "request_children"; requestId?: string; parentIds: string[] }
+    | { type: "release_subtree"; requestId?: string; parentIds: string[]; nodeIds: string[] }
+    | { type: "request_search"; requestId?: string; query: string };
 
 export class VerdeBackend {
     private readonly outputChannel: vscode.OutputChannel;
     private readonly statusBarItem: vscode.StatusBarItem;
-    private readonly onSnapshotReceived: (snapshot: Snapshot) => void;
+    private readonly onSnapshotReceived: (snapshot: Snapshot, isFull: boolean) => void;
     private readonly onDeltaReceived?: (ops: ExplorerDeltaOp[], addedRootIds?: string[]) => void;
     private readonly onConnectionLost?: () => void;
+    private readonly onSearchResultReceived?: (query: string, nodes: Node[]) => void;
+    private readonly onSnapshotTooBig?: () => void;
     private readonly propertyUpdateCallbacks: ((nodeId: string, properties: PropertiesData) => void)[] = [];
 
     private webSocketServer: WebSocketServer | null = null;
     private clients: Set<WebSocket> = new Set();
+    private connectionLostNotified: boolean = false;
     private operationCallbacks: Map<string, (result: OperationResult) => void> = new Map();
     private lastAckTime: number = 0;
     private ackTimeout: NodeJS.Timeout | null = null;
     private ackInterval: NodeJS.Timeout | null = null;
     private initialSyncComplete: boolean = false;
-    private pendingSnapshot: { rootIds: string[]; nodes: Snapshot["nodes"]; expectedNodes: number } | null = null;
-    private nextSnapshotPromise: Promise<Snapshot> | null = null;
-    private nextSnapshotResolve: ((snapshot: Snapshot) => void) | null = null;
+    private pendingFullSnapshot: {
+        promise: Promise<Snapshot>;
+        resolve: (snapshot: Snapshot) => void;
+        reject: (reason: Error) => void;
+        requestedAt: number;
+        timeout: NodeJS.Timeout;
+    } | null = null;
+    private static readonly FULL_SNAPSHOT_STALE_MS = 15000;
 
     constructor(
         outputChannel: vscode.OutputChannel,
         statusBarItem: vscode.StatusBarItem,
-        onSnapshotReceived: (snapshot: Snapshot) => void,
+        onSnapshotReceived: (snapshot: Snapshot, isFull: boolean) => void,
         onDeltaReceived?: (ops: ExplorerDeltaOp[], addedRootIds?: string[]) => void,
         onConnectionLost?: () => void,
+        onSearchResultReceived?: (query: string, nodes: Node[]) => void,
+        onSnapshotTooBig?: () => void,
     ) {
         this.outputChannel = outputChannel;
         this.statusBarItem = statusBarItem;
         this.onSnapshotReceived = onSnapshotReceived;
         this.onDeltaReceived = onDeltaReceived;
         this.onConnectionLost = onConnectionLost;
+        this.onSearchResultReceived = onSearchResultReceived;
+        this.onSnapshotTooBig = onSnapshotTooBig;
         this.updateStatusBar();
     }
 
@@ -160,6 +172,7 @@ export class VerdeBackend {
 
         this.webSocketServer.on("connection", (socket) => {
             this.clients.add(socket);
+            this.connectionLostNotified = false;
             this.log(`client connected (${this.clients.size} total)`);
             this.updateStatusBar();
 
@@ -169,8 +182,7 @@ export class VerdeBackend {
                 this.log(`client disconnected (${this.clients.size} total)`);
                 if (this.clients.size === 0) {
                     this.initialSyncComplete = false;
-                    this.pendingSnapshot = null;
-                    this.failPendingOperations("client disconnected");
+                    this.handleAllClientsDisconnected("client disconnected");
                 }
                 this.updateStatusBar();
             });
@@ -182,7 +194,7 @@ export class VerdeBackend {
             this.initialSyncComplete = false;
 
             this.send(socket, { type: "ack" });
-            this.requestSnapshot();
+            this.startAckInterval();
         });
 
         this.webSocketServer.on("error", (err) => {
@@ -221,15 +233,87 @@ export class VerdeBackend {
         }
 
         this.initialSyncComplete = false;
-        this.pendingSnapshot = null;
         this.failPendingOperations("backend stopped");
+        this.rejectPendingFullSnapshot("backend stopped");
         this.updateStatusBar();
     }
 
-    public async requestSnapshot(): Promise<void> {
-        for (const socket of this.clients) {
-            this.send(socket, { type: "request_snapshot" });
+    public requestSnapshot(full: boolean = false): Promise<Snapshot | null> {
+        if (this.clients.size === 0) {
+            return Promise.resolve(null);
         }
+
+        if (!full) {
+            this.broadcast({ type: "request_snapshot", full });
+            return Promise.resolve(null);
+        }
+
+        if (this.pendingFullSnapshot) {
+            if (Date.now() - this.pendingFullSnapshot.requestedAt < VerdeBackend.FULL_SNAPSHOT_STALE_MS) {
+                return this.pendingFullSnapshot.promise;
+            }
+            this.rejectPendingFullSnapshot("snapshot_request_abandoned");
+        }
+
+        let resolveFn!: (snapshot: Snapshot) => void;
+        let rejectFn!: (reason: Error) => void;
+        const promise = new Promise<Snapshot>((resolve, reject) => {
+            resolveFn = resolve;
+            rejectFn = reject;
+        });
+
+        promise.catch(() => {});
+        const timeout = setTimeout(
+            () => this.rejectPendingFullSnapshot("snapshot timeout"),
+            VerdeBackend.FULL_SNAPSHOT_STALE_MS,
+        );
+        this.pendingFullSnapshot = { promise, resolve: resolveFn, reject: rejectFn, requestedAt: Date.now(), timeout };
+
+        this.broadcast({ type: "request_snapshot", full: true });
+
+        return promise;
+    }
+
+    private handleAllClientsDisconnected(reason: string): void {
+        this.failPendingOperations(reason);
+        this.rejectPendingFullSnapshot(reason);
+        if (!this.connectionLostNotified) {
+            this.connectionLostNotified = true;
+            if (this.onConnectionLost) {
+                this.onConnectionLost();
+            }
+        }
+    }
+
+    private rejectPendingFullSnapshot(reason: string): void {
+        if (!this.pendingFullSnapshot) {
+            return;
+        }
+
+        const pending = this.pendingFullSnapshot;
+        this.pendingFullSnapshot = null;
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(reason));
+    }
+
+    public requestChildren(parentIds: string[]): void {
+        if (parentIds.length === 0) return;
+        this.log(`request_children for ${parentIds.length} parent(s): ${parentIds.join(", ")}`);
+        this.broadcast({ type: "request_children", parentIds });
+    }
+
+    public releaseSubtree(parentIds: string[], nodeIds: string[]): void {
+        if (parentIds.length === 0) return;
+        this.log(`release_subtree for ${parentIds.length} parent(s), ${nodeIds.length} node(s)`);
+        this.broadcast({ type: "release_subtree", parentIds, nodeIds });
+    }
+
+    public requestSearch(query: string): boolean {
+        if (this.clients.size === 0) {
+            return false;
+        }
+        this.broadcast({ type: "request_search", query });
+        return true;
     }
 
     public hasConnectedClient(): boolean {
@@ -248,13 +332,7 @@ export class VerdeBackend {
 
             this.operationCallbacks.set(operationId, resolve as (result: OperationResult) => void);
 
-            for (const socket of this.clients) {
-                this.send(socket, {
-                    type: "operation",
-                    operationId,
-                    operation
-                });
-            }
+            this.broadcast({ type: "operation", operationId, operation });
 
             setTimeout(() => {
                 if (this.operationCallbacks.has(operationId)) {
@@ -363,18 +441,6 @@ export class VerdeBackend {
         await this.sendOperation({ type: "redo" });
     }
 
-    public async waitForNextSnapshot(): Promise<Snapshot> {
-        if (this.nextSnapshotPromise) {
-            return this.nextSnapshotPromise;
-        }
-
-        this.nextSnapshotPromise = new Promise((resolve) => {
-            this.nextSnapshotResolve = resolve;
-        });
-
-        return this.nextSnapshotPromise;
-    }
-
     private onMessage(socket: WebSocket, rawData: RawData): void {
         const text = rawData.toString();
 
@@ -387,62 +453,6 @@ export class VerdeBackend {
         }
 
         switch (message.type) {
-            case "explorer_snapshot_start": {
-                this.lastAckTime = Date.now();
-                const startMessage = message as { type: "explorer_snapshot_start"; requestId?: string; rootIds: string[]; totalNodes: number };
-                if (!Array.isArray(startMessage.rootIds)) {
-                    this.send(socket, { type: "error", requestId: startMessage.requestId, message: "invalid_snapshot_start" });
-                    return;
-                }
-                this.pendingSnapshot = {
-                    rootIds: startMessage.rootIds,
-                    nodes: [],
-                    expectedNodes: typeof startMessage.totalNodes === "number" ? startMessage.totalNodes : 0,
-                };
-                this.log(`snapshot stream starting (${this.pendingSnapshot.expectedNodes} nodes expected)`);
-                this.send(socket, { type: "ack", requestId: startMessage.requestId });
-                return;
-            }
-
-            case "explorer_snapshot_chunk": {
-                this.lastAckTime = Date.now();
-                const chunkMessage = message as { type: "explorer_snapshot_chunk"; requestId?: string; nodes: Snapshot["nodes"] };
-                if (!this.pendingSnapshot) {
-                    this.send(socket, { type: "error", requestId: chunkMessage.requestId, message: "snapshot_chunk_without_start" });
-                    return;
-                }
-                if (Array.isArray(chunkMessage.nodes)) {
-                    for (const node of chunkMessage.nodes) {
-                        this.pendingSnapshot.nodes.push(node);
-                    }
-                }
-                this.send(socket, { type: "ack", requestId: chunkMessage.requestId });
-                return;
-            }
-
-            case "explorer_snapshot_end": {
-                this.lastAckTime = Date.now();
-                const endMessage = message as { type: "explorer_snapshot_end"; requestId?: string };
-                if (!this.pendingSnapshot) {
-                    this.send(socket, { type: "error", requestId: endMessage.requestId, message: "snapshot_end_without_start" });
-                    return;
-                }
-                const assembled: Snapshot = {
-                    rootIds: this.pendingSnapshot.rootIds,
-                    nodes: this.pendingSnapshot.nodes,
-                };
-                this.pendingSnapshot = null;
-                this.deliverSnapshot(assembled);
-                this.send(socket, { type: "ack", requestId: endMessage.requestId });
-
-                if (!this.initialSyncComplete) {
-                    this.initialSyncComplete = true;
-                    this.lastAckTime = Date.now();
-                    this.startAckInterval();
-                }
-                return;
-            }
-
             case "explorer_snapshot": {
                 this.lastAckTime = Date.now();
                 const payload = message.payload as Snapshot;
@@ -461,7 +471,8 @@ export class VerdeBackend {
                 }
 
                 this.log(`received explorer snapshot (${payload.nodes.length} nodes)`);
-                this.deliverSnapshot(payload);
+                const isFull = (message as { isFull?: boolean }).isFull === true;
+                this.deliverSnapshot(payload, isFull);
 
                 this.send(socket, { type: "ack", requestId: message.requestId });
 
@@ -473,6 +484,35 @@ export class VerdeBackend {
                 return;
             }
 
+            case "snapshot_too_big": {
+                this.lastAckTime = Date.now();
+
+                if (this.onSnapshotTooBig) {
+                    this.onSnapshotTooBig();
+                }
+
+                this.rejectPendingFullSnapshot("snapshot_too_big");
+                this.send(socket, { type: "ack", requestId: (message as any).requestId });
+                return;
+            }
+
+            case "search_result": {
+                this.lastAckTime = Date.now();
+                const searchResultMessage = message as { type: "search_result"; query: string; nodes: Node[]; truncated?: boolean; requestId?: string };
+                const nodes = Array.isArray(searchResultMessage.nodes) ? searchResultMessage.nodes : [];
+
+                if (searchResultMessage.truncated === true) {
+                    this.log(`search results for "${searchResultMessage.query}" truncated at ${nodes.length} nodes`);
+                }
+
+                if (this.onSearchResultReceived) {
+                    this.onSearchResultReceived(searchResultMessage.query ?? "", nodes);
+                }
+
+                this.send(socket, { type: "ack", requestId: searchResultMessage.requestId });
+                return;
+            }
+
             case "explorer_delta": {
                 this.lastAckTime = Date.now();
                 const deltaMessage = message as { type: "explorer_delta"; ops: ExplorerDeltaOp[]; addedRootIds?: string[] };
@@ -481,6 +521,12 @@ export class VerdeBackend {
                     this.send(socket, { type: "ack", requestId: (message as any).requestId });
                     return;
                 }
+                const opCounts = ops.reduce<Record<string, number>>((acc, op) => {
+                    acc[op.type] = (acc[op.type] ?? 0) + 1;
+                    return acc;
+                }, {});
+                const opSummary = Object.entries(opCounts).map(([t, n]) => `${t}×${n}`).join(", ");
+                this.log(`explorer_delta: ${ops.length} op(s) [${opSummary}]`);
                 if (this.onDeltaReceived) {
                     this.onDeltaReceived(ops, deltaMessage.addedRootIds);
                 }
@@ -531,13 +577,20 @@ export class VerdeBackend {
         }
     }
 
-    private deliverSnapshot(snapshot: Snapshot): void {
-        this.log(`delivering snapshot (${snapshot.nodes.length} nodes)`);
-        this.onSnapshotReceived(snapshot);
-        if (this.nextSnapshotResolve) {
-            this.nextSnapshotResolve(snapshot);
-            this.nextSnapshotPromise = null;
-            this.nextSnapshotResolve = null;
+    private deliverSnapshot(snapshot: Snapshot, isFull: boolean): void {
+        this.log(`delivering snapshot (${snapshot.nodes.length} nodes, isFull=${isFull})`);
+
+        if (!isFull) {
+            this.rejectPendingFullSnapshot("superseded_by_partial_snapshot");
+        }
+
+        this.onSnapshotReceived(snapshot, isFull);
+
+        if (isFull && this.pendingFullSnapshot) {
+            const pending = this.pendingFullSnapshot;
+            this.pendingFullSnapshot = null;
+            clearTimeout(pending.timeout);
+            pending.resolve(snapshot);
         }
     }
 
@@ -562,6 +615,12 @@ export class VerdeBackend {
         }
 
         socket.send(JSON.stringify(message));
+    }
+
+    private broadcast(message: BackendOutboundMessage): void {
+        for (const socket of this.clients) {
+            this.send(socket, message);
+        }
     }
 
     private startAckInterval(): void {
@@ -597,19 +656,14 @@ export class VerdeBackend {
                 }
 
                 if (this.clients.size === 0) {
-                    this.failPendingOperations("client disconnected");
-                    if (this.onConnectionLost) {
-                        this.onConnectionLost();
-                    }
+                    this.handleAllClientsDisconnected("client disconnected");
                 }
 
                 this.updateStatusBar();
                 return;
             }
 
-            for (const socket of this.clients) {
-                this.send(socket, { type: "ack" });
-            }
+            this.broadcast({ type: "ack" });
         }, 1000);
     }
 

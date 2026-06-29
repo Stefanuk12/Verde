@@ -1,10 +1,10 @@
-local SharedFolder = script.Parent.Parent.Shared
+local SharedFolder = require(script.Parent.Parent.Shared)
 
 local WebSocketClient = require(script.Parent.Parent.WebSocketClient)
-local Config = require(script.Parent.Parent.Shared.Config)
-local ButtonInstance = require(SharedFolder.ButtonInstance)
-local Icons = require(SharedFolder.Icons)
-local State = require(SharedFolder.State)
+local Config = SharedFolder.Config
+local ButtonInstance = SharedFolder.ButtonInstance
+local Icons = SharedFolder.Icons
+local State = SharedFolder.State
 
 local connecting = State.new()
 
