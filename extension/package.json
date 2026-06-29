@@ -64,6 +64,11 @@
           "type": "boolean",
           "default": false,
           "description": "Allow third-party extensions to execute Luau code inside Roblox Studio via Verde's API. Also requires the workspace to be trusted; untrusted workspaces always refuse. Each extension is prompted for consent on first use. Disable to block all extension-initiated scripting."
+        },
+        "verde.singleClickToOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, single-clicking an instance opens it immediately. Scripts open in the editor and other instances open in the Properties panel. When disabled, those actions require a double-click."
         }
       }
     },

@@ -34,6 +34,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 	const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri || context.extensionUri;
 	sourcemapParser = new SourcemapParser(workspaceRoot);
 	instanceHistory = new InstanceHistory(10);
+	const showNodeInProperties = (node: Node) => {
+		propertiesViewProvider.show(node);
+
+		const instancePath = getInstancePath(node);
+		instanceHistory.add(node, instancePath);
+	};
 
 	const revealOnNextSnapshot = (
 		editorUriToMatch: string | null,
@@ -209,13 +215,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 	);
 
 	explorerViewProvider.onSelectionChanged((selection) => {
-		if (selection.length === 1) {
-			const node = selection[0];
-			propertiesViewProvider.show(node);
-
-			const instancePath = getInstancePath(node);
-			instanceHistory.add(node, instancePath);
+		if (selection.length !== 1) {
+			return;
 		}
+
+		if (!vscode.workspace.getConfiguration('verde').get<boolean>('singleClickToOpen', false)) {
+			return;
+		}
+
+		showNodeInProperties(selection[0]);
+	});
+
+	explorerViewProvider.onNodeActivated((node) => {
+		showNodeInProperties(node);
 	});
 
 	context.subscriptions.push(

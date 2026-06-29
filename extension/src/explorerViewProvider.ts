@@ -34,6 +34,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   private webviewView: vscode.WebviewView | undefined;
   private selectedIds: string[] = [];
   private selectionListeners: ((nodes: Node[]) => void)[] = [];
+  private activationListeners: ((node: Node) => void)[] = [];
   private knownParentIds: Set<string> = new Set();
   private fullSyncStatus: FullSyncStatus = "unknown";
   private pendingSearchQuery: string | null = null;
@@ -227,6 +228,10 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     this.selectionListeners.push(listener);
   }
 
+  public onNodeActivated(listener: (node: Node) => void): void {
+    this.activationListeners.push(listener);
+  }
+
   public getSelection(): Node[] {
     return this.selectedIds
       .map(id => this.explorerProvider.getNodeById(id))
@@ -319,6 +324,9 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration("verde.coloredSelection") || e.affectsConfiguration("verde.coloredSelectionColor")) {
         this.pushSelectionColor();
       }
+      if (e.affectsConfiguration("verde.singleClickToOpen")) {
+        this.pushInteractionSettings();
+      }
     });
     const assetBase = webviewView.webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "assets")
@@ -327,6 +335,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     this.pushSnapshot();
     this.pushSyncStatus();
     this.pushSelectionColor();
+    this.pushInteractionSettings();
   }
 
   public refreshWebviewHtml(): void {
@@ -417,6 +426,14 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private pushInteractionSettings(): void {
+    const cfg = vscode.workspace.getConfiguration("verde");
+    this.post({
+      type: "updateInteractionSettings",
+      singleClickToOpen: cfg.get<boolean>("singleClickToOpen", false),
+    });
+  }
+
   private serializeChildren(parentId: string | null): WebviewNode[] {
     const children = this.explorerProvider.getSortedChildren(parentId);
     return children.map(n => this.serializeNode(n));
@@ -459,12 +476,23 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     for (const cb of this.selectionListeners) cb(nodes);
   }
 
+  private fireNodeActivated(node: Node): void {
+    for (const cb of this.activationListeners) cb(node);
+  }
+
   private onMessage(msg: any): void {
     switch (msg.type) {
       case "selectionChanged":
         this.selectedIds = msg.nodeIds ?? [];
         this.fireSelectionChanged();
         break;
+      case "nodeActivated": {
+        const node = this.explorerProvider.getNodeById(msg.nodeId);
+        if (node) {
+          this.fireNodeActivated(node);
+        }
+        break;
+      }
       case "requestChildren": {
         const parentId = typeof msg.nodeId === "string" ? msg.nodeId : "";
         const key = parentId === "" ? null : parentId;
@@ -712,6 +740,7 @@ var SLOW_CLICK_RENAME_DELAY=800;
 var DBLCLICK_THRESHOLD=400;
 var slowClickTimer=null;
 var lastClickTime=0,lastClickId=null;
+var singleClickToOpen=false;
 
 var expandedIds=new Set();
 var dragSourceId=null;
@@ -876,6 +905,9 @@ window.addEventListener('message',function(e){
           so.textContent='.tree-row.selected{background:'+m.color+' !important}#tree:focus-within .tree-row.selected{background:'+m.color+' !important}';
         }else{so.textContent=''}
       }
+      break;
+    case 'updateInteractionSettings':
+      singleClickToOpen=!!m.singleClickToOpen;
       break;
     case 'collapseAll':
       if(localSyncStatus!=='full'&&!searchFilter){
@@ -1154,6 +1186,7 @@ treeEl.addEventListener('click',function(e){
   lastClickId=id;
   if(isDbl){
     lastClickId=null;
+    if(!singleClickToOpen){vscode.postMessage({type:'nodeActivated',nodeId:id})}
     if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id});return}
     var node=nodes[id];
     if(!searchFilter&&node&&node.hasChildren===true){toggleExpand(id)}
@@ -1175,6 +1208,10 @@ treeEl.addEventListener('click',function(e){
   }
   updateSelVis();
   vscode.postMessage({type:'selectionChanged',nodeIds:selectedIds.slice()});
+  if(singleClickToOpen&&!e.ctrlKey&&!e.metaKey&&selectedIds.length===1&&selectedIds[0]===id){
+    vscode.postMessage({type:'nodeActivated',nodeId:id});
+    if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id})}
+  }
 });
 
 treeEl.addEventListener('dblclick',function(e){e.preventDefault()});

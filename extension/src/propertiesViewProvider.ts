@@ -106,6 +106,7 @@ export class PropertiesViewProvider implements vscode.WebviewViewProvider {
 			this.separatePanel.title = `Properties - ${this.currentNodeClassName} - ${this.currentNodeName}`;
 			this.loadPropertiesForPanel(this.separatePanel.webview);
 		} else if (this.webviewView) {
+			this.webviewView.show?.(true);
 			setTimeout(() => {
 				this.loadProperties();
 			}, 100);
