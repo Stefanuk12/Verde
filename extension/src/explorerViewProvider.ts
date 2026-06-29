@@ -6,6 +6,7 @@ import { getClassNames } from "./robloxClasses";
 import { isScriptClass, scriptIconClass, buildDottedPath } from "./utils";
 import { getThemeCssBlock, getThemeScriptBlock, getThemeStyleAttribute } from "./webviewTheme";
 import { ContextMenuRegistry } from "./contextMenuRegistry";
+import { getBundledIconsUri, getCustomIconClassNames, getCustomIconsUri } from "./iconResolver";
 
 type WebviewNode = {
   id: string;
@@ -311,10 +312,13 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken,
   ): void {
     this.webviewView = webviewView;
+    const bundledIconsUri = getBundledIconsUri(this.extensionUri);
+    const customIconsUri = getCustomIconsUri();
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [
-        vscode.Uri.joinPath(this.extensionUri, "assets"),
+        bundledIconsUri,
+        ...(customIconsUri ? [customIconsUri] : []),
         vscode.Uri.joinPath(this.extensionUri, "resources"),
       ],
     };
@@ -328,10 +332,16 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         this.pushInteractionSettings();
       }
     });
-    const assetBase = webviewView.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "assets")
-    ).toString();
-    webviewView.webview.html = this.buildHtml(webviewView.webview, assetBase);
+    const assetBase = webviewView.webview.asWebviewUri(bundledIconsUri).toString();
+    const customAssetBase = customIconsUri
+      ? webviewView.webview.asWebviewUri(customIconsUri).toString()
+      : null;
+    webviewView.webview.html = this.buildHtml(
+      webviewView.webview,
+      assetBase,
+      customAssetBase,
+      Array.from(getCustomIconClassNames()),
+    );
     this.pushSnapshot();
     this.pushSyncStatus();
     this.pushSelectionColor();
@@ -340,10 +350,26 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
 
   public refreshWebviewHtml(): void {
     if (!this.webviewView) return;
-    const assetBase = this.webviewView.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "assets")
-    ).toString();
-    this.webviewView.webview.html = this.buildHtml(this.webviewView.webview, assetBase);
+    const bundledIconsUri = getBundledIconsUri(this.extensionUri);
+    const customIconsUri = getCustomIconsUri();
+    this.webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [
+        bundledIconsUri,
+        ...(customIconsUri ? [customIconsUri] : []),
+        vscode.Uri.joinPath(this.extensionUri, "resources"),
+      ],
+    };
+    const assetBase = this.webviewView.webview.asWebviewUri(bundledIconsUri).toString();
+    const customAssetBase = customIconsUri
+      ? this.webviewView.webview.asWebviewUri(customIconsUri).toString()
+      : null;
+    this.webviewView.webview.html = this.buildHtml(
+      this.webviewView.webview,
+      assetBase,
+      customAssetBase,
+      Array.from(getCustomIconClassNames()),
+    );
     this.pushSnapshot();
     this.pushSyncStatus();
   }
@@ -636,7 +662,12 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private buildHtml(webview: vscode.Webview, assetBase: string): string {
+  private buildHtml(
+    webview: vscode.Webview,
+    assetBase: string,
+    customAssetBase: string | null,
+    customIconNames: string[],
+  ): string {
     const csp = webview.cspSource;
     const themeStyle = getThemeStyleAttribute();
     const themeCss = getThemeCssBlock();
@@ -724,6 +755,12 @@ ${themeScript}
 <script>
 (function(){
 var ASSET=${JSON.stringify(assetBase)};
+var CUSTOM_ASSET=${JSON.stringify(customAssetBase)};
+var CUSTOM_ICON_NAMES=new Set(${JSON.stringify(customIconNames)});
+function iconSrc(name){
+  if(CUSTOM_ASSET&&CUSTOM_ICON_NAMES.has(name))return CUSTOM_ASSET+'/'+name+'.png';
+  return ASSET+'/'+name+'.png';
+}
 var CLASSES=${JSON.stringify(getClassNames())};
 var vscode=acquireVsCodeApi();
 
@@ -1121,7 +1158,8 @@ function buildRowHtml(row,rowIndex,h){
   }
   h.push('<div class="'+rowClass+'" data-id="'+id+'" data-s="'+(n.isScript?1:0)+'" data-disabled="'+(disabled?1:0)+'" draggable="'+(depth>0?'true':'false')+'" style="'+style+'">');
   h.push('<span class="tree-arrow'+ac+'"></span>');
-  h.push('<img class="tree-icon" src="'+ASSET+'/'+esc(n.iconClassName||n.className)+'.png"'+(disabled?' style="opacity:.45"':'')+'>');
+  var iconName=esc(n.iconClassName||n.className);
+  h.push('<img class="tree-icon" src="'+iconSrc(iconName)+'"'+(disabled?' style="opacity:.45"':'')+'>');
   h.push('<span class="tree-name-group">');
   if(id===renameNodeId){
     h.push('<input class="tree-rename-input" type="text" value="'+esc(n.name)+'" data-id="'+id+'">');
@@ -1343,7 +1381,8 @@ function renderQA(){
   for(var i=0;i<qaFiltered.length;i++){
     var c=qaFiltered[i];
     html+='<div class="qa-item'+(i===qaIdx?' selected':'')+'" data-cls="'+esc(c)+'">';
-    html+='<img class="qa-icon" src="'+ASSET+'/'+esc(c)+'.png">';
+    var iconName=esc(c);
+    html+='<img class="qa-icon" src="'+iconSrc(iconName)+'">';
     html+='<span>'+esc(c)+'</span></div>';
   }
   qaListEl.innerHTML=html;

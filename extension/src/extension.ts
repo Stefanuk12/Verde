@@ -10,6 +10,7 @@ import { InstanceHistory, HistoryEntry } from "./instanceHistory";
 import { ContextMenuRegistry } from "./contextMenuRegistry";
 import { LuauExecutionService } from "./luauExecutionService";
 import { VerdeApi } from "./api";
+import { invalidateCustomIconCache, resolveIconUri } from "./iconResolver";
 
 import * as fzy from "fzy.js";
 
@@ -85,42 +86,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		});
 	};
 
-	const buildQuickPickItem = (node: Node, detail: string): vscode.QuickPickItem & { node: Node } => {
+	const buildQuickPickItem = async (node: Node, detail: string): Promise<vscode.QuickPickItem & { node: Node }> => {
 		return {
 			label: node.name,
 			description: node.className,
 			detail,
-			iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", `${node.className}.png`),
+			iconPath: await resolveIconUri(context.extensionUri, node.className),
 			alwaysShow: true,
 			node
 		};
 	};
 
-	const addNodesToQuickPickCache = (nodes: Node[], pathCache: Map<string, string>) => {
+	const addNodesToQuickPickCache = async (nodes: Node[], pathCache: Map<string, string>) => {
 		for (const node of nodes) {
 			const detail = dottedPath(node, pathCache);
 			cachedSearchStrings.push(detail);
-			cachedQuickPickItems.push(buildQuickPickItem(node, detail));
+			cachedQuickPickItems.push(await buildQuickPickItem(node, detail));
 		}
 	};
 
-	const rebuildQuickPickCache = () => {
+	const rebuildQuickPickCache = async () => {
 		cachedSearchStrings = [];
 		cachedQuickPickItems = [];
-		addNodesToQuickPickCache(explorerProvider.getAllNodes(), new Map<string, string>());
+		await addNodesToQuickPickCache(explorerProvider.getAllNodes(), new Map<string, string>());
 		if (onQuickPickCacheRebuilt) onQuickPickCacheRebuilt();
 	};
 
-	const appendQuickPickCache = (added: Node[]) => {
+	const appendQuickPickCache = async (added: Node[]) => {
 		if (added.length === 0) return;
-		addNodesToQuickPickCache(added, new Map<string, string>());
+		await addNodesToQuickPickCache(added, new Map<string, string>());
 		if (onQuickPickCacheRebuilt) onQuickPickCacheRebuilt();
 	};
 
 	backend = new VerdeBackend(outputChannel, statusBarItem, (snapshot, isFull) => {
 		explorerProvider.setSnapshot(snapshot, isFull);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
-		rebuildQuickPickCache();
+		void rebuildQuickPickCache();
 		explorerViewProvider?.notifySnapshotReplaced();
 		if (isFull) {
 			explorerViewProvider?.markFullSyncSucceeded();
@@ -135,9 +136,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		}
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
 		if (needsRebuild) {
-			rebuildQuickPickCache();
+			void rebuildQuickPickCache();
 		} else if (added.length > 0) {
-			appendQuickPickCache(added);
+			void appendQuickPickCache(added);
 		}
 	}, () => {
 		explorerProvider.setSnapshot({ nodes: [], rootIds: [] });
@@ -150,9 +151,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		const { added, needsRebuild } = explorerProvider.mergeSearchResults(nodes);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
 		if (needsRebuild) {
-			rebuildQuickPickCache();
+			void rebuildQuickPickCache();
 		} else {
-			appendQuickPickCache(added);
+			void appendQuickPickCache(added);
 		}
 		explorerViewProvider?.handleSearchResults(query, nodes);
 	}, () => {
@@ -211,6 +212,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		vscode.window.onDidChangeActiveColorTheme(() => {
 			explorerViewProvider.refreshWebviewHtml();
 			propertiesViewProvider.refreshWebviewHtml();
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration((event) => {
+			if (!event.affectsConfiguration("verde.iconDirectory")) {
+				return;
+			}
+
+			invalidateCustomIconCache();
+			explorerViewProvider.refreshWebviewHtml();
+			void initClassNames(context, () => explorerViewProvider.postClassNames());
+			void rebuildQuickPickCache();
 		})
 	);
 
@@ -731,10 +745,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				return;
 			}
 
-			const quickPickItems = getClassNames().map(className => ({
+			const quickPickItems = await Promise.all(getClassNames().map(async className => ({
 				label: className,
-				iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", `${className}.png`)
-			}));
+				iconPath: await resolveIconUri(context.extensionUri, className)
+			})));
 
 			const selectedItem = await vscode.window.showQuickPick(
 				quickPickItems,
