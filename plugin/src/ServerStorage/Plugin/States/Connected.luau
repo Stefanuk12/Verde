@@ -12,6 +12,7 @@ local ButtonInstance = SharedFolder.ButtonInstance
 local Icons = SharedFolder.Icons
 local State = SharedFolder.State
 local Operations = require(script.Parent.Parent.Operations)
+local SearchIndex = require(script.Parent.Parent.SearchIndex)
 
 type Client = WebSocketClient.WebSocketClientInstance
 
@@ -37,6 +38,7 @@ local lastSearchMatched: { Instance } = {}
 local lastSearchTruncated = false
 local searchCacheDirty = false
 local searchGeneration = 0
+local queuedSearchPromise: any = nil
 
 local lastAckTime = 0
 local initialSyncComplete = false
@@ -274,11 +276,18 @@ local function _sendSnapshot(client: Client, full: boolean?)
 	end
 
 	local snapshot, instanceMap
+	local searchBuildToken: number? = nil
 	if full then
-		snapshot, instanceMap = SerializeDatamodel.serializeFull(MAX_FULL_SYNC_NODES)
+		local token = SearchIndex.beginBuild()
+		searchBuildToken = token
+		snapshot, instanceMap = SerializeDatamodel.serializeFull(MAX_FULL_SYNC_NODES, function(instance)
+			SearchIndex.addVisitedInstance(token, instance)
+		end)
 		if not snapshot or not instanceMap then
+			SearchIndex.cancelBuild(token)
 			fullSyncMode = false
 			_sendSnapshotTooBig(client)
+			SearchIndex.rebuildAsync()
 			return
 		end
 	else
@@ -330,6 +339,9 @@ local function _sendSnapshot(client: Client, full: boolean?)
 			isFull = full == true,
 		})
 	then
+		if searchBuildToken then
+			SearchIndex.cancelBuild(searchBuildToken)
+		end
 		warn("[verde] failed to send explorer_snapshot (will retry)")
 		if not snapshotPromise then
 			snapshotPromise = Promise.delay(0.1):andThen(function()
@@ -342,6 +354,11 @@ local function _sendSnapshot(client: Client, full: boolean?)
 
 	lastAckTime = tick()
 	initialSyncComplete = true
+	if searchBuildToken then
+		SearchIndex.finishBuild(searchBuildToken)
+	else
+		SearchIndex.rebuildAsync()
+	end
 end
 
 local function _sendOperationResult(
@@ -486,6 +503,10 @@ local function _handleRequestSearch(client: Client, query: string?)
 
 	local trimmed = query and string.gsub(query, "^%s*(.-)%s*$", "%1") or ""
 	if #trimmed < 2 then
+		if queuedSearchPromise then
+			queuedSearchPromise:cancel()
+			queuedSearchPromise = nil
+		end
 		_releaseSearchGrafted(nil)
 		_resetSearchCache()
 		return
@@ -493,24 +514,121 @@ local function _handleRequestSearch(client: Client, query: string?)
 
 	local lowercase = string.lower(trimmed)
 
-	local candidates: { Instance }? = nil
-	if
-		fullSyncMode
-		and lastSearchLower ~= ""
-		and not lastSearchTruncated
-		and not searchCacheDirty
-		and #lowercase >= #lastSearchLower
-		and string.sub(lowercase, 1, #lastSearchLower) == lastSearchLower
-	then
-		candidates = lastSearchMatched
-	end
-
 	searchCacheDirty = false
 
-	local nodes, resultInstanceMap, truncated, matched =
-		SerializeDatamodel.serializeSearchResults(lowercase, candidates)
+	local function shouldCancel(): boolean
+		return generation ~= searchGeneration or not client.connected
+	end
 
-	if generation ~= searchGeneration then
+	local function sendMatches(
+		matches: { Instance },
+		partial: boolean,
+		searchTruncated: boolean,
+		rebuildingIndex: boolean?
+	)
+		if shouldCancel() then
+			return
+		end
+
+		local nodes, resultInstanceMap, nodeTruncated =
+			SerializeDatamodel.serializeSearchMatches(matches)
+		local truncated = searchTruncated or nodeTruncated
+
+		if shouldCancel() then
+			return
+		end
+
+		_releaseSearchGrafted(resultInstanceMap)
+		for id, instance in resultInstanceMap do
+			_registerAndTrack(client, id, instance)
+			if not loadedParents[id] then
+				searchGraftedIds[id] = true
+			end
+		end
+
+		local message: any = {
+			type = "search_result",
+			query = trimmed,
+			nodes = nodes,
+			truncated = truncated,
+			partial = partial,
+		}
+		if rebuildingIndex then
+			message.rebuildingIndex = true
+		end
+		_encodeAndSend(client, message)
+	end
+
+	local function retryWhenIndexReady()
+		if queuedSearchPromise then
+			queuedSearchPromise:cancel()
+		end
+		queuedSearchPromise = Promise.delay(0.1):andThen(function()
+			queuedSearchPromise = nil
+			if generation ~= searchGeneration or not client.connected then
+				return
+			end
+			if SearchIndex.isBuilding() then
+				retryWhenIndexReady()
+			else
+				_handleRequestSearch(client, trimmed)
+			end
+		end)
+	end
+
+	if not SearchIndex.isReady() then
+		if SearchIndex.isBuilding() then
+			local partialMatched, partialTruncated, partialCanceled =
+				SearchIndex.search(lowercase, shouldCancel, function(firstMatches, partialTruncated)
+					sendMatches(firstMatches, true, partialTruncated, true)
+				end)
+			if partialCanceled or shouldCancel() then
+				return
+			end
+
+			lastSearchLower = lowercase
+			lastSearchMatched = partialMatched
+			lastSearchTruncated = partialTruncated
+			sendMatches(partialMatched, true, partialTruncated, true)
+			retryWhenIndexReady()
+			return
+		end
+
+		local nodes, resultInstanceMap, truncated, matched, canceled =
+			SerializeDatamodel.serializeSearchResults(lowercase, nil, shouldCancel)
+
+		if canceled or shouldCancel() then
+			return
+		end
+
+		lastSearchLower = lowercase
+		lastSearchMatched = matched
+		lastSearchTruncated = truncated
+
+		_releaseSearchGrafted(resultInstanceMap)
+		for id, instance in resultInstanceMap do
+			_registerAndTrack(client, id, instance)
+			if not loadedParents[id] then
+				searchGraftedIds[id] = true
+			end
+		end
+
+		_encodeAndSend(client, {
+			type = "search_result",
+			query = trimmed,
+			nodes = nodes,
+			truncated = truncated,
+			partial = false,
+			rebuildingIndex = SearchIndex.isBuilding(),
+		})
+		return
+	end
+
+	local matched, truncated, canceled = SearchIndex.search(lowercase, shouldCancel, function(firstMatches, partialTruncated)
+		sendMatches(firstMatches, true, partialTruncated)
+	end)
+
+	if canceled or shouldCancel() then
 		return
 	end
 
@@ -518,20 +636,7 @@ local function _handleRequestSearch(client: Client, query: string?)
 	lastSearchMatched = matched
 	lastSearchTruncated = truncated
 
-	_releaseSearchGrafted(resultInstanceMap)
-	for id, instance in resultInstanceMap do
-		_registerAndTrack(client, id, instance)
-		if not loadedParents[id] then
-			searchGraftedIds[id] = true
-		end
-	end
-
-	_encodeAndSend(client, {
-		type = "search_result",
-		query = trimmed,
-		nodes = nodes,
-		truncated = truncated,
-	})
+	sendMatches(matched, false, truncated)
 end
 
 local function _handleRequestChildren(client: Client, parentIds: { string })
@@ -542,7 +647,6 @@ local function _handleRequestChildren(client: Client, parentIds: { string })
 	for _, parentId in parentIds do
 		local parentInstance = InstanceMap[parentId]
 		if not parentInstance then
-			warn("[verde] request_children for unknown parent:", parentId)
 			continue
 		end
 
@@ -675,6 +779,7 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 			end
 
 			searchCacheDirty = true
+			SearchIndex.addSubtree(descendant)
 
 			if not _shouldSyncNewDescendant(descendant) then
 				local parentId = _parentDebugId(descendant)
@@ -713,6 +818,7 @@ connected.onEnter = function(transitionTo: (string) -> (), client: WebSocketClie
 		connections,
 		game.DescendantRemoving:Connect(function(descendant)
 			local instanceId = descendant:GetDebugId(0)
+			SearchIndex.removeSubtree(descendant)
 			if not InstanceMap[instanceId] then
 				return
 			end
@@ -773,6 +879,11 @@ connected.onExit = function()
 		propertyUpdatePromise:cancel()
 	end
 
+	if queuedSearchPromise then
+		queuedSearchPromise:cancel()
+		queuedSearchPromise = nil
+	end
+
 	table.clear(connections)
 	table.clear(pendingOps)
 	table.clear(InstanceMap)
@@ -781,6 +892,7 @@ connected.onExit = function()
 	end
 	table.clear(searchGraftedIds)
 	_resetSearchCache()
+	SearchIndex.clear()
 	fullSyncMode = false
 	lastAckTime = tick()
 	initialSyncComplete = false

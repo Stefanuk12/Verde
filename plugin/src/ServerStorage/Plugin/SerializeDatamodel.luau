@@ -23,6 +23,8 @@ type Snapshot = {
 	nodes: { Node },
 }
 
+type InstanceVisitCallback = (Instance) -> ()
+
 local YIELD_EVERY = 5000
 local MAX_DEPTH = 10000
 local MAX_NODES = 50000
@@ -47,7 +49,10 @@ local function makeNode(instance: Instance, parentId: string?): Node
 	return node
 end
 
-function SerializeDatamodel.serializeFull(maxNodes: number?): (Snapshot?, { [string]: Instance }?)
+function SerializeDatamodel.serializeFull(
+	maxNodes: number?,
+	onVisitedInstance: InstanceVisitCallback?
+): (Snapshot?, { [string]: Instance }?)
 	local limit: number = maxNodes or MAX_NODES
 	local nodes: { Node } = {}
 	local instanceMap: { [string]: Instance } = {}
@@ -86,6 +91,10 @@ function SerializeDatamodel.serializeFull(maxNodes: number?): (Snapshot?, { [str
 		instanceMap[id] = instance
 		nodes[#nodes + 1] = node
 		nodeCount += 1
+
+		if onVisitedInstance then
+			onVisitedInstance(instance)
+		end
 
 		if parentNode then
 			parentNode.children[#parentNode.children + 1] = id
@@ -160,16 +169,76 @@ function SerializeDatamodel.serializeShallow(instance: Instance, parentId: strin
 	return node
 end
 
+function SerializeDatamodel.serializeSearchMatches(
+	matches: { Instance },
+	maxNodes: number?
+): ({ Node }, { [string]: Instance }, boolean)
+	local limit = maxNodes or MAX_SEARCH_RESULTS
+	local nodes: { Node } = {}
+	local instanceMap: { [string]: Instance } = {}
+	local visited: { [string]: true } = {}
+	local truncated = false
+
+	local function include(instance: Instance): boolean
+		local id = instance:GetDebugId(0)
+		if visited[id] then
+			return true
+		end
+
+		if #nodes >= limit then
+			truncated = true
+			return false
+		end
+
+		local parent = instance.Parent
+		local parentId: string? = nil
+		if parent and parent ~= game then
+			if not include(parent) then
+				return false
+			end
+			parentId = parent:GetDebugId(0)
+		end
+
+		visited[id] = true
+
+		local node = SerializeDatamodel.serializeShallow(instance, parentId)
+
+		instanceMap[id] = instance
+		table.insert(nodes, node)
+		return true
+	end
+
+	for _, instance in matches do
+		if instance.Parent == nil then
+			continue
+		end
+		if not include(instance) then
+			break
+		end
+	end
+
+	return nodes, instanceMap, truncated
+end
+
 function SerializeDatamodel.serializeSearchResults(
 	lowercaseQuery: string,
-	candidates: { Instance }?
-): ({ Node }, { [string]: Instance }, boolean, { Instance })
+	candidates: { Instance }?,
+	shouldCancel: (() -> boolean)?
+): ({ Node }, { [string]: Instance }, boolean, { Instance }, boolean)
 	local nodes: { Node } = {}
 	local instanceMap: { [string]: Instance } = {}
 	local visited: { [string]: true } = {}
 	local matched: { Instance } = {}
 	local truncated = false
+	local canceled = false
 
+	local function shouldStop(): boolean
+		if shouldCancel and shouldCancel() then
+			canceled = true
+			return true
+		end
+		return false
+	end
 	local function include(instance: Instance): boolean
 		local id = instance:GetDebugId(0)
 		if visited[id] then
@@ -247,6 +316,9 @@ function SerializeDatamodel.serializeSearchResults(
 
 	local considered = 0
 	local function consider(instance: Instance): boolean
+		if shouldStop() then
+			return false
+		end
 		if #nodes >= MAX_SEARCH_RESULTS then
 			truncated = true
 			return false
@@ -254,6 +326,9 @@ function SerializeDatamodel.serializeSearchResults(
 		considered += 1
 		if considered % YIELD_EVERY == 0 then
 			task.wait()
+			if shouldStop() then
+				return false
+			end
 		end
 		if instance.Parent == nil then
 			return true
@@ -282,13 +357,13 @@ function SerializeDatamodel.serializeSearchResults(
 					break
 				end
 			end
-			if truncated then
+			if truncated or canceled then
 				break
 			end
 		end
 	end
 
-	return nodes, instanceMap, truncated, matched
+	return nodes, instanceMap, truncated, matched, canceled
 end
 
 return SerializeDatamodel
