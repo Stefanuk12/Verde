@@ -141,9 +141,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 		explorerViewProvider?.resetFullSyncStatus();
 		explorerViewProvider?.notifySnapshotReplaced();
 	}, (query, nodes) => {
-		if (explorerViewProvider?.getFullSyncStatus() !== "too_big") {
-			return;
-		}
 		const { added, needsRebuild } = explorerProvider.mergeSearchResults(nodes);
 		instanceHistory.updateNodeReferences((id: string) => explorerProvider.getNodeById(id));
 		if (needsRebuild) {

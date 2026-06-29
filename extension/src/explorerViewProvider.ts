@@ -11,6 +11,7 @@ type WebviewNode = {
   id: string;
   name: string;
   className: string;
+  parentId: string | null;
   iconClassName: string;
   hasChildren: boolean;
   isScript: boolean;
@@ -19,6 +20,11 @@ type WebviewNode = {
 };
 
 type FullSyncStatus = "unknown" | "full" | "too_big";
+
+type SearchResultsPayload = {
+  nodes: WebviewNode[];
+  matchIds: string[];
+};
 
 const MAX_LOCAL_SEARCH_RESULTS = 500;
 
@@ -64,7 +70,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   public reissueServerSearch(): boolean {
-    if (this.fullSyncStatus === "too_big" && this.currentSearchQuery.length >= 2) {
+    if (this.currentSearchQuery.length >= 2) {
       this.backend.requestSearch(this.currentSearchQuery);
       return true;
     }
@@ -105,74 +111,102 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
   }
 
   private handleSearchInput(query: string): void {
-    this.currentSearchQuery = query;
+    this.currentSearchQuery = query.trim().toLowerCase();
+    this.pendingSearchQuery = null;
 
-    if (query === "") {
-      this.pendingSearchQuery = null;
+    if (this.currentSearchQuery === "") {
       this.backend.requestSearch("");
-      this.postSearchResults("", []);
+      this.postSearchResults("", { nodes: [], matchIds: [] });
       return;
     }
 
-    if (this.fullSyncStatus === "full") {
-      this.pendingSearchQuery = null;
-      this.postSearchResults(query, this.computeLocalMatches(query));
+    if (this.currentSearchQuery.length < 2) {
+      this.backend.requestSearch("");
+      this.postSearchResults(this.currentSearchQuery, { nodes: [], matchIds: [] });
       return;
     }
 
-    if (this.fullSyncStatus === "too_big") {
-      this.pendingSearchQuery = null;
-      if (query.length < 2) {
-        this.backend.requestSearch("");
-        this.postSearchResults(query, []);
-        return;
+    if (!this.backend.requestSearch(this.currentSearchQuery)) {
+      if (this.fullSyncStatus === "full") {
+        this.postSearchResults(this.currentSearchQuery, this.computeLocalMatches(this.currentSearchQuery));
+      } else {
+        this.postSearchResults(this.currentSearchQuery, { nodes: [], matchIds: [] });
       }
-      if (!this.backend.requestSearch(query)) {
-        this.postSearchResults(query, []);
-      }
-      return;
     }
-
-    this.pendingSearchQuery = query;
-    this.requestFullSnapshotForQuery(query);
   }
 
   public handleSearchResults(query: string, nodes: Node[]): void {
-    if (this.fullSyncStatus !== "too_big") return;
-    if (query.toLowerCase() !== this.currentSearchQuery) return;
-
-    const tokens = this.searchTokens(this.currentSearchQuery);
-    const pathCache = new Map<string, string>();
-    const rows: WebviewNode[] = [];
-    for (const raw of nodes) {
-      const node = this.explorerProvider.getNodeById(raw.id) ?? raw;
-      if (this.matchesTokens(node, tokens, pathCache)) {
-        rows.push(this.serializeNode(node));
-      }
+    const normalizedQuery = query.trim().toLowerCase();
+    if (normalizedQuery !== this.currentSearchQuery) {
+      return;
     }
-    this.postSearchResults(this.currentSearchQuery, rows);
+
+    this.postSearchResults(this.currentSearchQuery, this.buildSearchResults(this.currentSearchQuery, nodes));
   }
 
-  private postSearchResults(query: string, nodes: WebviewNode[]): void {
-    this.post({ type: "searchResults", query, nodes });
+  private postSearchResults(query: string, results: SearchResultsPayload): void {
+    this.post({ type: "searchResults", query, nodes: results.nodes, matchIds: results.matchIds });
   }
 
   private searchTokens(query: string): string[] {
     return query.toLowerCase().split(/[\s.]+/).filter(t => t.length > 0);
   }
 
-  private computeLocalMatches(query: string): WebviewNode[] {
+  private buildSearchResults(query: string, sourceNodes: Node[]): SearchResultsPayload {
     const tokens = this.searchTokens(query);
-    if (tokens.length === 0) return [];
     const pathCache = new Map<string, string>();
     const rows: WebviewNode[] = [];
-    for (const node of this.explorerProvider.getAllNodes()) {
-      if (this.matchesTokens(node, tokens, pathCache)) {
+    const matchIds: string[] = [];
+    const seen = new Set<string>();
+
+    for (const raw of sourceNodes) {
+      const node = this.explorerProvider.getNodeById(raw.id) ?? raw;
+      if (!seen.has(node.id)) {
         rows.push(this.serializeNode(node));
-        if (rows.length >= MAX_LOCAL_SEARCH_RESULTS) break;
+        seen.add(node.id);
+      }
+      if (this.matchesTokens(node, tokens, pathCache)) {
+        matchIds.push(node.id);
       }
     }
-    return rows;
+
+    return { nodes: rows, matchIds };
+  }
+
+  private computeLocalMatches(query: string): SearchResultsPayload {
+    const tokens = this.searchTokens(query);
+    if (tokens.length === 0) {
+      return { nodes: [], matchIds: [] };
+    }
+    const pathCache = new Map<string, string>();
+    const rows: WebviewNode[] = [];
+    const matchIds: string[] = [];
+    const seen = new Set<string>();
+    const addWithAncestors = (node: Node): void => {
+      if (seen.has(node.id)) {
+        return;
+      }
+      if (node.parentId !== null) {
+        const parent = this.explorerProvider.getNodeById(node.parentId);
+        if (parent) {
+          addWithAncestors(parent);
+        }
+      }
+      if (!seen.has(node.id)) {
+        rows.push(this.serializeNode(node));
+        seen.add(node.id);
+      }
+    };
+    for (const node of this.explorerProvider.getAllNodes()) {
+      if (this.matchesTokens(node, tokens, pathCache)) {
+        matchIds.push(node.id);
+        addWithAncestors(node);
+        if (matchIds.length >= MAX_LOCAL_SEARCH_RESULTS) {
+          break;
+        }
+      }
+    }
+    return { nodes: rows, matchIds };
   }
 
   private matchesTokens(node: Node, tokens: string[], pathCache: Map<string, string>): boolean {
@@ -239,17 +273,31 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
     return { chain, preload };
   }
 
-  public reveal(node: Node): void {
+  public reveal(node: Node, options?: { preserveFocus?: boolean; select?: boolean }): void {
     const { chain, preload } = this.buildAncestorPreload(node);
-    this.selectedIds = [node.id];
-    this.post({
+    const shouldSelect = options?.select !== false;
+    const message: {
+      type: "revealNode";
+      nodeId: string;
+      chain: string[];
+      preload: Record<string, WebviewNode[]>;
+      preserveFocus: boolean;
+      selectedIds?: string[];
+    } = {
       type: "revealNode",
       nodeId: node.id,
       chain,
       preload,
-      selectedIds: [node.id],
-    });
-    this.fireSelectionChanged();
+      preserveFocus: options?.preserveFocus === true,
+    };
+    if (shouldSelect) {
+      this.selectedIds = [node.id];
+      message.selectedIds = [node.id];
+    }
+    this.post(message);
+    if (shouldSelect) {
+      this.fireSelectionChanged();
+    }
   }
 
   public resolveWebviewView(
@@ -380,6 +428,7 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
       id: n.id,
       name: n.name,
       className: n.className,
+      parentId: n.parentId,
       iconClassName: scriptIconClass(n.className, n.runContext),
       hasChildren: n.hasChildren === true || n.children.length > 0,
       isScript,
@@ -479,6 +528,17 @@ export class ExplorerViewProvider implements vscode.WebviewViewProvider {
         this.handleSearchInput(query);
         break;
       }
+      case "revealSearchResult": {
+        const nodeId = typeof msg.nodeId === "string" ? msg.nodeId : "";
+        const node = this.explorerProvider.getNodeById(nodeId);
+        if (node) {
+          this.reveal(node, {
+            preserveFocus: msg.preserveFocus === true,
+            select: msg.select !== false,
+          });
+        }
+        break;
+      }
       case "releaseSubtree": {
         const parentIds = Array.isArray(msg.parentIds)
           ? msg.parentIds.filter((id: unknown): id is string => typeof id === "string")
@@ -575,6 +635,7 @@ body{display:flex;flex-direction:column}
 .tree-row{display:flex;align-items:center;height:22px;cursor:pointer;padding-right:0;white-space:nowrap;user-select:none;position:absolute;left:0;right:0}
 .tree-row:hover{background:var(--vscode-list-hoverBackground)}
 .tree-row.selected{background:var(--vscode-list-inactiveSelectionBackground);color:var(--vscode-list-inactiveSelectionForeground)}
+.tree-row.previewed{background:var(--vscode-list-hoverBackground);outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
 #tree:focus-within .tree-row.selected{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
 .tree-row.dragging{opacity:0.5}
 .tree-row.drag-over{background:var(--vscode-list-dropBackground);outline:1px solid var(--vscode-focusBorder)}
@@ -675,6 +736,7 @@ function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 var lastSearchQuerySent=null;
 var localSyncStatus='unknown';
 var searchResultIds=null;
+var searchTreeIds=null;
 function sendSearchQuery(q){
   if(q===lastSearchQuerySent)return;
   lastSearchQuerySent=q;
@@ -726,14 +788,22 @@ window.addEventListener('message',function(e){
       rootIds=[];for(var i=0;i<(m.rootNodes||[]).length;i++)rootIds.push(m.rootNodes[i].id);
       childrenByParent['']=rootIds.slice();
       selectedIds=m.selectedIds||[];
-      lastSearchQuerySent=null;searchResultIds=null;
+      lastSearchQuerySent=null;searchResultIds=null;searchTreeIds=null;previewRevealNodeId=null;pendingPreviewSearchQuery=null;pendingPreviewNodeId=null;
       if(searchFilter)sendSearchQuery(searchFilter);
       renderTree();break;
     case 'searchResults':
       if(m.query!==searchFilter)break;
-      ingestNodes(m.nodes||[]);
-      searchResultIds=[];for(var i=0;i<(m.nodes||[]).length;i++)searchResultIds.push(m.nodes[i].id);
-      renderTree();break;
+      var resultNodes=m.nodes||[];
+      ingestNodes(resultNodes);
+      searchTreeIds=[];
+      for(var i=0;i<resultNodes.length;i++)searchTreeIds.push(resultNodes[i].id);
+      searchResultIds=[];
+      var matchIds=Array.isArray(m.matchIds)?m.matchIds:null;
+      if(matchIds){for(var i=0;i<matchIds.length;i++){if(nodes[matchIds[i]])searchResultIds.push(matchIds[i])}}
+      else{for(var i=0;i<resultNodes.length;i++)searchResultIds.push(resultNodes[i].id)}
+      previewRevealNodeId=null;pendingPreviewSearchQuery=null;pendingPreviewNodeId=null;
+      renderTree();
+      break;
     case 'children':
       delete pendingChildren[m.parentId];
       storeChildren(m.parentId,m.nodes||[]);
@@ -771,9 +841,10 @@ window.addEventListener('message',function(e){
       var pre=m.preload||{};
       for(var pid in pre){storeChildren(pid,pre[pid])}
       for(var i=0;i<chain.length;i++)expandedIds.add(chain[i]);
-      selectedIds=m.selectedIds||[];
+      if(Array.isArray(m.selectedIds))selectedIds=m.selectedIds;
+      if(m.preserveFocus){previewRevealNodeId=m.nodeId||null;pendingPreviewSearchQuery=null;pendingPreviewNodeId=null}
       saveExp();renderTree();
-      requestAnimationFrame(function(){scrollTo(m.nodeId);treeEl.focus()});break;
+      requestAnimationFrame(function(){scrollTo(m.nodeId);if(!m.preserveFocus)treeEl.focus()});break;
     case 'focusTree':
       treeEl.focus();break;
     case 'scrollToNode':
@@ -829,26 +900,51 @@ window.addEventListener('message',function(e){
 
 var searchDebounce=null;
 var searchFilter='';
+var previewRevealNodeId=null;
+var pendingPreviewSearchQuery=null;
+var pendingPreviewNodeId=null;
+function revealSearchResult(id){
+  if(!id)return;
+  clearTimeout(searchDebounce);searchDebounce=null;
+  searchEl.value='';
+  searchFilter='';
+  searchResultIds=null;
+  searchTreeIds=null;
+  previewRevealNodeId=null;
+  pendingPreviewSearchQuery=null;pendingPreviewNodeId=null;
+  lastSearchQuerySent=null;
+  renderTree();
+  vscode.postMessage({type:'revealSearchResult',nodeId:id});
+  setTimeout(function(){sendSearchQuery('')},0);
+}
+function previewSearchResult(id,query){
+  if(!id)return;
+  pendingPreviewSearchQuery=query||searchFilter;
+  pendingPreviewNodeId=id;
+  vscode.postMessage({type:'revealSearchResult',nodeId:id,preserveFocus:true,select:false});
+}
 searchEl.addEventListener('input',function(){
   var raw=searchEl.value.trim().toLowerCase();
-  if(searchDebounce)clearTimeout(searchDebounce);
+  clearTimeout(searchDebounce);
   if(!raw){
-    lastSearchQuerySent=null;searchResultIds=null;
+    lastSearchQuerySent=null;searchResultIds=null;searchTreeIds=null;previewRevealNodeId=null;pendingPreviewSearchQuery=null;pendingPreviewNodeId=null;
     sendSearchQuery('');
     searchFilter='';renderTree();return;
   }
-  searchDebounce=setTimeout(function(){
-    if(raw!==searchFilter)searchResultIds=null;
-    sendSearchQuery(raw);
-    searchFilter=raw;renderTree();
-  },50);
+  if(raw!==searchFilter){searchResultIds=null;searchTreeIds=null;previewRevealNodeId=null;pendingPreviewSearchQuery=null;pendingPreviewNodeId=null}
+  searchFilter=raw;
+  renderTree();
+  sendSearchQuery(raw);
 });
 searchEl.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
-    if(searchDebounce){clearTimeout(searchDebounce);searchDebounce=null}
-    lastSearchQuerySent=null;searchResultIds=null;
+    clearTimeout(searchDebounce);searchDebounce=null;
+    lastSearchQuerySent=null;searchResultIds=null;searchTreeIds=null;previewRevealNodeId=null;
     sendSearchQuery('');
     searchEl.value='';searchFilter='';renderTree();treeEl.focus();e.preventDefault();
+  }else if(e.key==='Enter'&&searchFilter&&searchResultIds&&searchResultIds.length===1){
+    revealSearchResult(searchResultIds[0]);
+    e.preventDefault();
   }
 });
 
@@ -881,13 +977,53 @@ var flatRows=[];
 var vLastStart=-1,vLastEnd=-1;
 var scrollRaf=false;
 
+function buildSearchFlatRows(){
+  var matches=searchResultIds||[];
+  if(matches.length===0)return;
+  var visible={};
+  for(var i=0;i<matches.length;i++){
+    var cur=nodes[matches[i]];
+    var guard=0;
+    while(cur&&guard++<1000){
+      if(visible[cur.id])break;
+      visible[cur.id]=true;
+      if(!cur.parentId)break;
+      cur=nodes[cur.parentId];
+    }
+  }
+  var childMap={'':[]};
+  var linked={};
+  function link(parentId,id){
+    var key=parentId||'';
+    if(!childMap[key])childMap[key]=[];
+    if(linked[key+'\\n'+id])return;
+    linked[key+'\\n'+id]=true;
+    childMap[key].push(id);
+  }
+  function place(id){
+    if(!visible[id]||!nodes[id])return;
+    var pid=nodes[id].parentId||'';
+    if(pid&&!visible[pid])pid='';
+    link(pid,id);
+  }
+  var order=(searchTreeIds&&searchTreeIds.length)?searchTreeIds:matches;
+  for(var i=0;i<order.length;i++)place(order[i]);
+  for(var id in visible)place(id);
+  function walkSearch(parentId,depth){
+    var kids=childMap[parentId]||[];
+    for(var i=0;i<kids.length;i++){
+      var id=kids[i];
+      var hasKids=!!(childMap[id]&&childMap[id].length);
+      flatRows.push({id:id,depth:depth,searchHasChildren:hasKids});
+      walkSearch(id,depth+1);
+    }
+  }
+  walkSearch('',0);
+}
+
 function buildFlatRows(){
   flatRows=[];
-  if(searchFilter){
-    var ids=searchResultIds||[];
-    for(var i=0;i<ids.length;i++){if(nodes[ids[i]])flatRows.push({id:ids[i],depth:0})}
-    return;
-  }
+  if(searchFilter){buildSearchFlatRows();return}
   function walk(id,depth){
     var n=nodes[id];if(!n)return;
     flatRows.push({id:id,depth:depth});
@@ -921,21 +1057,25 @@ function renderViewport(){
   var h=[];
   for(var i=start;i<end;i++){
     var r=flatRows[i];
-    buildRowHtml(r.id,r.depth,i,h);
+    buildRowHtml(r,i,h);
   }
   rowsEl.innerHTML=h.join('');
   if(renameNodeId)afterRenameInputMount();
 }
 
-function buildRowHtml(id,depth,rowIndex,h){
+function buildRowHtml(row,rowIndex,h){
+  var id=row.id;
+  var depth=row.depth;
   var n=nodes[id];if(!n)return;
-  var has=n.hasChildren===true;
-  var exp=expandedIds.has(id);
-  var sel=selectedIds.indexOf(id)>=0;
-  var pad=depth*INDENT;
+  var inSearch=!!searchFilter;
+  var has=inSearch?row.searchHasChildren===true:n.hasChildren===true;
+  var exp=inSearch?has:expandedIds.has(id);
   var ac=has?(exp?' expanded':''):' leaf';
+  var sel=selectedIds.indexOf(id)>=0;
+  var preview=previewRevealNodeId===id;
+  var pad=depth*INDENT;
   var disabled=n.isScript&&n.disabled===true;
-  var rowClass='tree-row'+(sel?' selected':'')+(depth>0?' tree-indent-guides':'')+(disabled?' script-disabled':'');
+  var rowClass='tree-row'+(sel?' selected':'')+(preview?' previewed':'')+(depth>0?' tree-indent-guides':'')+(disabled?' script-disabled':'');
   var top=rowIndex*ROW_HEIGHT;
   var style='top:'+top+'px;height:'+ROW_HEIGHT+'px;padding-left:'+pad+'px';
   if(depth>0){
@@ -1004,7 +1144,8 @@ treeEl.addEventListener('click',function(e){
   var arrow=e.target.closest('.tree-arrow');
   if(arrow&&!arrow.classList.contains('leaf')){
     lastClickId=null;
-    toggleExpand(id);return;
+    if(!searchFilter)toggleExpand(id);
+    return;
   }
   if(e.target.closest('.tree-add-btn')){lastClickId=null;openQA(id,row);return}
   var now=Date.now();
@@ -1015,7 +1156,13 @@ treeEl.addEventListener('click',function(e){
     lastClickId=null;
     if(row.dataset.s==='1'){vscode.postMessage({type:'scriptActivated',nodeId:id});return}
     var node=nodes[id];
-    if(node&&node.hasChildren===true){toggleExpand(id)}
+    if(!searchFilter&&node&&node.hasChildren===true){toggleExpand(id)}
+    return;
+  }
+  if(searchFilter){
+    previewRevealNodeId=id;
+    pendingPreviewSearchQuery=null;pendingPreviewNodeId=null;
+    renderTree();
     return;
   }
   if(e.ctrlKey||e.metaKey){var i=selectedIds.indexOf(id);if(i>=0)selectedIds.splice(i,1);else selectedIds.push(id)}
