@@ -10,7 +10,7 @@ import { InstanceHistory, HistoryEntry } from "./instanceHistory";
 import { ContextMenuRegistry } from "./contextMenuRegistry";
 import { LuauExecutionService } from "./luauExecutionService";
 import { VerdeApi } from "./api";
-import { resolveIconUri } from "./iconResolver";
+import { invalidateCustomIconCache, resolveIconUri } from "./iconResolver";
 
 import * as fzy from "fzy.js";
 
@@ -221,6 +221,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<VerdeA
 				return;
 			}
 
+			invalidateCustomIconCache();
 			explorerViewProvider.refreshWebviewHtml();
 			void initClassNames(context, () => explorerViewProvider.postClassNames());
 			void rebuildQuickPickCache();

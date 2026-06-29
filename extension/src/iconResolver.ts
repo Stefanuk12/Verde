@@ -8,6 +8,15 @@ const ICON_DIRECTORY_CANDIDATE_SUFFIXES = [
     "",
 ];
 
+type CustomIconCache = {
+    resolvedDirectoryPath?: string;
+    iconsUri?: vscode.Uri;
+    iconClassNames: Set<string>;
+};
+
+let customIconCacheKey: string | undefined;
+let customIconCache: CustomIconCache | undefined;
+
 function getConfiguredIconDirectory(): string | undefined {
     const configured = vscode.workspace
         .getConfiguration("verde")
@@ -32,15 +41,6 @@ function resolveIconDirectoryPath(): string | undefined {
 
     const workspaceBase = getWorkspaceBasePath();
     return workspaceBase ? path.resolve(workspaceBase, configured) : undefined;
-}
-
-async function fileExists(uri: vscode.Uri): Promise<boolean> {
-    try {
-        await vscode.workspace.fs.stat(uri);
-        return true;
-    } catch {
-        return false;
-    }
 }
 
 function directoryExists(fsPath: string): boolean {
@@ -84,29 +84,52 @@ export function getBundledIconsUri(extensionUri: vscode.Uri): vscode.Uri {
     return vscode.Uri.joinPath(extensionUri, "assets");
 }
 
+function getCustomIconCacheKey(): string | undefined {
+    const resolvedDirectoryPath = resolveIconDirectoryPath();
+    return resolvedDirectoryPath ? path.normalize(resolvedDirectoryPath) : undefined;
+}
+
+function getCustomIconCache(): CustomIconCache {
+    const cacheKey = getCustomIconCacheKey();
+    if (customIconCache && customIconCacheKey === cacheKey) {
+        return customIconCache;
+    }
+
+    const resolvedDirectoryPath = resolveExistingIconDirectory(cacheKey);
+    const iconClassNames = resolvedDirectoryPath
+        ? readPngBaseNames(resolvedDirectoryPath)
+        : new Set<string>();
+
+    customIconCacheKey = cacheKey;
+    customIconCache = {
+        resolvedDirectoryPath,
+        iconsUri: resolvedDirectoryPath ? vscode.Uri.file(resolvedDirectoryPath) : undefined,
+        iconClassNames,
+    };
+
+    return customIconCache;
+}
+
+export function invalidateCustomIconCache(): void {
+    customIconCacheKey = undefined;
+    customIconCache = undefined;
+}
+
 export function getCustomIconsUri(): vscode.Uri | undefined {
-    const resolved = resolveExistingIconDirectory(resolveIconDirectoryPath());
-    return resolved ? vscode.Uri.file(resolved) : undefined;
+    return getCustomIconCache().iconsUri;
 }
 
 export function getCustomIconClassNames(): Set<string> {
-    const resolved = resolveExistingIconDirectory(resolveIconDirectoryPath());
-    if (!resolved) {
-        return new Set<string>();
-    }
-    return readPngBaseNames(resolved);
+    return new Set(getCustomIconCache().iconClassNames);
 }
 
 export async function resolveIconUri(
     extensionUri: vscode.Uri,
     iconName: string,
 ): Promise<vscode.Uri> {
-    const customIconsUri = getCustomIconsUri();
-    if (customIconsUri) {
-        const customIconUri = vscode.Uri.joinPath(customIconsUri, `${iconName}.png`);
-        if (await fileExists(customIconUri)) {
-            return customIconUri;
-        }
+    const customIconCache = getCustomIconCache();
+    if (customIconCache.iconsUri && customIconCache.iconClassNames.has(iconName)) {
+        return vscode.Uri.joinPath(customIconCache.iconsUri, `${iconName}.png`);
     }
 
     return vscode.Uri.joinPath(getBundledIconsUri(extensionUri), `${iconName}.png`);
@@ -116,7 +139,8 @@ export async function getAvailableIconClassNames(
     extensionUri: vscode.Uri,
 ): Promise<Set<string>> {
     const names = new Set<string>();
-    const sources = [getBundledIconsUri(extensionUri), getCustomIconsUri()].filter(
+    const customIconCache = getCustomIconCache();
+    const sources = [getBundledIconsUri(extensionUri)].filter(
         (uri): uri is vscode.Uri => uri !== undefined,
     );
 
@@ -131,6 +155,10 @@ export async function getAvailableIconClassNames(
         } catch {
             // Ignore missing or unreadable custom icon directories and fall back to bundled icons.
         }
+    }
+
+    for (const name of customIconCache.iconClassNames) {
+        names.add(name);
     }
 
     return names;
